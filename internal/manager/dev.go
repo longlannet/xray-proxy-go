@@ -152,6 +152,9 @@ func (a *App) cleanupManagedDevConfig(user string, managed []string) error {
 	if err := restoreGitProxyValues(user, "https.proxy", nil, managed); err != nil {
 		return err
 	}
+	if !commandExists("npm") {
+		return nil
+	}
 	if current := getNPMConfig(user, "proxy"); current != nil && containsString(managed, *current) {
 		if err := runAsUser(user, "npm", "config", "delete", "proxy"); err != nil {
 			return err
@@ -166,6 +169,9 @@ func (a *App) cleanupManagedDevConfig(user string, managed []string) error {
 }
 
 func restoreGitProxyValues(user, key string, original []string, managed []string) error {
+	if !commandExists("git") {
+		return nil
+	}
 	current := getGitConfigAll(user, key)
 	_ = runAsUser(user, "git", "config", "--global", "--unset-all", key)
 	values := []string{}
@@ -187,6 +193,9 @@ func restoreGitProxyValues(user, key string, original []string, managed []string
 }
 
 func restoreNPMProxyValue(user, key string, original *string, managed []string) error {
+	if !commandExists("npm") {
+		return nil
+	}
 	current := getNPMConfig(user, key)
 	if original != nil {
 		return runAsUser(user, "npm", "config", "set", key, *original)

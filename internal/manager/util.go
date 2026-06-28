@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -131,6 +133,12 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	return os.Rename(tmpName, path)
 }
 
+// writeUserFileAtomic 以 root 身份在目标用户家目录内原子写入一个属于该用户的文件。
+//
+// 由于 root 写入用户可控目录，存在符号链接 TOCTOU 风险（用户可能把中途某级目录
+// 换成符号链接，把写入重定向到任意路径）。这里通过 openat + O_NOFOLLOW 逐级打开/
+// 创建目录链，所有创建、改属主、临时文件写入和 rename 都相对已校验的目录 fd 完成，
+// 任何一级是符号链接都会被拒绝，从根本上消除路径再次解析带来的竞争窗口。
 func writeUserFileAtomic(userName, path string, data []byte, perm os.FileMode) error {
 	identity, err := lookupLocalUserIdentity(userName)
 	if err != nil {
@@ -145,35 +153,131 @@ func writeUserFileAtomic(userName, path string, data []byte, perm os.FileMode) e
 		return fmt.Errorf("用户级配置路径必须位于用户 %s 的家目录内：%s", userName, path)
 	}
 	dir := filepath.Dir(cleanPath)
-	if err := ensureUserOwnedDirChain(cleanHome, dir, identity.UID, identity.GID); err != nil {
-		return err
+	rel, err := filepath.Rel(cleanHome, dir)
+	if err != nil || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("用户级配置目录必须位于用户家目录内：%s", dir)
 	}
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(cleanPath)+".tmp.*")
+
+	dirFD, err := openUserDirChain(cleanHome, rel, identity.UID, identity.GID)
 	if err != nil {
 		return err
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
+	defer syscall.Close(dirFD)
+
+	base := filepath.Base(cleanPath)
+	tmpName, tmpFD, err := createTempFileAt(dirFD, base, perm)
+	if err != nil {
 		return err
 	}
-	if err := tmp.Close(); err != nil {
+	committed := false
+	f := os.NewFile(uintptr(tmpFD), tmpName)
+	defer func() {
+		if !committed {
+			_ = syscall.Unlinkat(dirFD, tmpName)
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
 		return err
 	}
-	if err := os.Chmod(tmpName, perm); err != nil {
+	if err := syscall.Fchown(int(f.Fd()), identity.UID, identity.GID); err != nil {
+		_ = f.Close()
 		return err
 	}
-	if err := os.Chown(tmpName, identity.UID, identity.GID); err != nil {
+	if err := syscall.Fchmod(int(f.Fd()), uint32(perm.Perm())); err != nil {
+		_ = f.Close()
 		return err
 	}
-	if err := os.Rename(tmpName, cleanPath); err != nil {
+	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Chown(cleanPath, identity.UID, identity.GID); err != nil {
+	if err := syscall.Renameat(dirFD, tmpName, dirFD, base); err != nil {
 		return err
 	}
-	return os.Chmod(cleanPath, perm)
+	committed = true
+	return nil
+}
+
+var userTmpCounter uint64
+
+// createTempFileAt 在 dirFD 目录下创建一个唯一的临时文件，使用 O_EXCL|O_NOFOLLOW
+// 保证不会跟随符号链接、也不会覆盖已存在的文件。
+func createTempFileAt(dirFD int, base string, perm os.FileMode) (string, int, error) {
+	flags := syscall.O_CREAT | syscall.O_EXCL | syscall.O_WRONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
+	for i := 0; i < 100; i++ {
+		seq := atomic.AddUint64(&userTmpCounter, 1)
+		name := fmt.Sprintf(".%s.tmp.%d.%d", base, os.Getpid(), seq)
+		fd, err := syscall.Openat(dirFD, name, flags, uint32(perm.Perm()))
+		if err == nil {
+			return name, fd, nil
+		}
+		if err != syscall.EEXIST {
+			return "", -1, fmt.Errorf("创建用户级临时文件失败：%w", err)
+		}
+	}
+	return "", -1, fmt.Errorf("创建用户级临时文件失败：重试次数过多")
+}
+
+// openUserDirChain 从家目录开始，沿 rel 逐级 openat 打开（必要时创建）目录，
+// 全程使用 O_NOFOLLOW 拒绝符号链接，并确保每级目录属于目标用户。返回最终目录 fd。
+func openUserDirChain(home, rel string, uid, gid int) (int, error) {
+	homeFD, err := syscall.Open(home, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, fmt.Errorf("打开用户家目录失败：%s：%w", home, err)
+	}
+	if rel == "." {
+		return homeFD, nil
+	}
+	current := homeFD
+	for _, part := range strings.Split(rel, string(os.PathSeparator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		next, err := openOwnedDirAt(current, part, uid, gid)
+		_ = syscall.Close(current)
+		if err != nil {
+			return -1, err
+		}
+		current = next
+	}
+	return current, nil
+}
+
+func openOwnedDirAt(dirFD int, name string, uid, gid int) (int, error) {
+	flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_DIRECTORY | syscall.O_CLOEXEC
+	created := false
+	fd, err := syscall.Openat(dirFD, name, flags, 0)
+	if err != nil {
+		if err != syscall.ENOENT {
+			return -1, fmt.Errorf("打开用户级配置目录 %s 失败（拒绝符号链接）：%w", name, err)
+		}
+		mkErr := syscall.Mkdirat(dirFD, name, 0o755)
+		if mkErr != nil && mkErr != syscall.EEXIST {
+			return -1, fmt.Errorf("创建用户级配置目录 %s 失败：%w", name, mkErr)
+		}
+		created = mkErr == nil
+		fd, err = syscall.Openat(dirFD, name, flags, 0)
+		if err != nil {
+			return -1, fmt.Errorf("打开用户级配置目录 %s 失败（创建后，拒绝符号链接）：%w", name, err)
+		}
+	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		_ = syscall.Close(fd)
+		return -1, err
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+		_ = syscall.Close(fd)
+		return -1, fmt.Errorf("用户级配置路径不是目录：%s", name)
+	}
+	// 仅对本函数新建的目录设置属主，避免强行改写用户已存在目录（如 ~/.config）的属主。
+	if created && (int(st.Uid) != uid || int(st.Gid) != gid) {
+		if err := syscall.Fchown(fd, uid, gid); err != nil {
+			_ = syscall.Close(fd)
+			return -1, err
+		}
+	}
+	return fd, nil
 }
 
 func ensureUserHomeUsable(home, userName string) error {
@@ -191,61 +295,6 @@ func ensureUserHomeUsable(home, userName string) error {
 		return fmt.Errorf("用户 %s 的家目录不是目录：%s", userName, home)
 	}
 	return nil
-}
-
-func ensureUserOwnedDirChain(home, dir string, uid, gid int) error {
-	rel, err := filepath.Rel(home, dir)
-	if err != nil || rel == "." || filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") {
-		return fmt.Errorf("用户级配置目录必须位于用户家目录内：%s", dir)
-	}
-	current := home
-	for _, part := range strings.Split(rel, string(os.PathSeparator)) {
-		if part == "" || part == "." {
-			continue
-		}
-		current = filepath.Join(current, part)
-		if err := ensureUserOwnedDir(current, uid, gid, 0o755); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func ensureUserOwnedDir(path string, uid, gid int, perm os.FileMode) error {
-	created := false
-	if err := os.Mkdir(path, perm); err != nil {
-		if !errors.Is(err, os.ErrExist) {
-			return err
-		}
-	} else {
-		created = true
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("用户级配置目录不能是符号链接：%s", path)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("用户级配置路径不是目录：%s", path)
-	}
-	if created {
-		if err := os.Chmod(path, perm); err != nil {
-			return err
-		}
-	}
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok && int(stat.Uid) == uid && int(stat.Gid) == gid {
-		return nil
-	}
-	return os.Chown(path, uid, gid)
-}
-
-func run(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
 }
 
 func runQuiet(name string, args ...string) error {
@@ -291,7 +340,8 @@ func runAsUser(user, name string, args ...string) error {
 		return runQuietLabel("以用户 "+user+" 执行命令 "+name, "runuser", runArgs...)
 	}
 	if _, err := exec.LookPath("sudo"); err == nil {
-		runArgs := append([]string{"-H", "-u", user, name}, args...)
+		// -n：非交互，需要密码时直接失败而不是挂起等待输入。
+		runArgs := append([]string{"-n", "-H", "-u", user, name}, args...)
 		return runQuietLabel("以用户 "+user+" 执行命令 "+name, "sudo", runArgs...)
 	}
 	return fmt.Errorf("需要 runuser 或 sudo 才能以用户 %s 执行命令", user)
@@ -305,7 +355,7 @@ func outputAsUser(user, name string, args ...string) (string, error) {
 		runArgs := append([]string{"-u", user, "--", name}, args...)
 		cmd = exec.Command("runuser", runArgs...)
 	} else if _, err := exec.LookPath("sudo"); err == nil {
-		runArgs := append([]string{"-H", "-u", user, name}, args...)
+		runArgs := append([]string{"-n", "-H", "-u", user, name}, args...)
 		cmd = exec.Command("sudo", runArgs...)
 	} else {
 		return "", fmt.Errorf("需要 runuser 或 sudo 才能以用户 %s 执行命令", user)
@@ -314,11 +364,26 @@ func outputAsUser(user, name string, args ...string) (string, error) {
 	return string(b), err
 }
 
-func ask(prompt string) string {
+// stdinReader 是进程级共享的标准输入读取器。共享单个 bufio.Reader 可避免每次
+// ask 都新建 Reader 时丢失上一次读取已缓冲（read-ahead）的字节。
+var stdinReader = bufio.NewReader(os.Stdin)
+
+// ask 读取一行输入。第二个返回值在遇到 EOF 且没有任何输入时为 false，
+// 调用方据此退出交互菜单，避免在 stdin 关闭时陷入死循环。
+func ask(prompt string) (string, bool) {
 	fmt.Print(prompt)
-	r := bufio.NewReader(os.Stdin)
-	s, _ := r.ReadString('\n')
-	return strings.TrimSpace(s)
+	s, err := stdinReader.ReadString('\n')
+	s = strings.TrimSpace(s)
+	if err != nil && s == "" {
+		return "", false
+	}
+	return s, true
+}
+
+// commandExists 报告命令是否在当前 PATH 中可用。
+func commandExists(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
 }
 
 func fileExists(path string) bool {
@@ -464,23 +529,39 @@ func parseSystemdTargetName(name string) (systemdTargetName, error) {
 		if err := validateUserName(userName); err != nil {
 			return systemdTargetName{}, err
 		}
-		service = normalizeSystemdServiceName(service)
-		if err := safeSystemdServiceName(service); err != nil {
+		normalized, err := normalizeTargetServiceName(service)
+		if err != nil {
 			return systemdTargetName{}, err
 		}
-		return systemdTargetName{UserMode: true, User: userName, Service: service}, nil
-	}
-	service := name
-	if !strings.HasSuffix(service, ".service") {
-		if !systemdPlainNameRE.MatchString(service) {
-			return systemdTargetName{}, fmt.Errorf("目标服务名包含非法字符：%s", name)
+		if err := safeSystemdServiceName(normalized); err != nil {
+			return systemdTargetName{}, err
 		}
-		service = normalizeSystemdServiceName(service)
+		return systemdTargetName{UserMode: true, User: userName, Service: normalized}, nil
+	}
+	service, err := normalizeTargetServiceName(name)
+	if err != nil {
+		return systemdTargetName{}, err
 	}
 	if err := safeSystemdServiceName(service); err != nil {
 		return systemdTargetName{}, err
 	}
 	return systemdTargetName{Service: service}, nil
+}
+
+// normalizeTargetServiceName 把简写服务名补全为 *.service。对于不含 .service 的简写，
+// 拒绝包含 '@' 的形式：避免操作员误把 "foo@bar" 当普通服务，却被 systemd 解释为模板
+// 实例单元。确需模板实例时请写完整的 name@instance.service。
+func normalizeTargetServiceName(name string) (string, error) {
+	if strings.HasSuffix(name, ".service") {
+		return name, nil
+	}
+	if strings.Contains(name, "@") {
+		return "", fmt.Errorf("模板实例服务名请使用完整形式 name@instance.service：%s", name)
+	}
+	if !systemdPlainNameRE.MatchString(name) {
+		return "", fmt.Errorf("目标服务名包含非法字符：%s", name)
+	}
+	return normalizeSystemdServiceName(name), nil
 }
 
 func normalizeSystemdServiceName(name string) string {
@@ -506,6 +587,14 @@ func lookupLocalUserIdentity(userName string) (localUserIdentity, error) {
 	if err := validateUserName(userName); err != nil {
 		return localUserIdentity{}, err
 	}
+	// 优先用 getent，以支持 NSS（LDAP/SSSD/systemd-userdb 等）用户。CGO_ENABLED=0 的
+	// 静态二进制下 os/user 只读 /etc/passwd，无法解析 NSS，因此显式调用 getent；
+	// getent 不可用或未命中时回退到直接解析 /etc/passwd，与 `id -u` 的判断保持一致。
+	if line, ok := getentPasswd(userName); ok {
+		if id, err := parsePasswdLine(line, userName); err == nil {
+			return id, nil
+		}
+	}
 	b, err := os.ReadFile("/etc/passwd")
 	if err != nil {
 		return localUserIdentity{}, err
@@ -518,20 +607,49 @@ func lookupLocalUserIdentity(userName string) (localUserIdentity, error) {
 		if len(fields) < 7 || fields[0] != userName {
 			continue
 		}
-		if fields[2] == "" || fields[3] == "" || fields[5] == "" {
-			break
-		}
-		uid, err := strconv.Atoi(fields[2])
-		if err != nil || uid < 0 {
-			return localUserIdentity{}, fmt.Errorf("用户 %s 的 UID 无效", userName)
-		}
-		gid, err := strconv.Atoi(fields[3])
-		if err != nil || gid < 0 {
-			return localUserIdentity{}, fmt.Errorf("用户 %s 的 GID 无效", userName)
-		}
-		return localUserIdentity{Name: userName, UID: uid, GID: gid, UIDText: fields[2], GIDText: fields[3], Home: fields[5]}, nil
+		return parsePasswdLine(line, userName)
 	}
 	return localUserIdentity{}, fmt.Errorf("未找到系统用户：%s", userName)
+}
+
+// parsePasswdLine 解析一行 passwd 记录（name:passwd:uid:gid:gecos:home:shell）。
+func parsePasswdLine(line, userName string) (localUserIdentity, error) {
+	fields := strings.Split(line, ":")
+	if len(fields) < 7 || fields[0] != userName {
+		return localUserIdentity{}, fmt.Errorf("未找到系统用户：%s", userName)
+	}
+	if fields[2] == "" || fields[3] == "" || fields[5] == "" {
+		return localUserIdentity{}, fmt.Errorf("用户 %s 的 passwd 记录不完整", userName)
+	}
+	uid, err := strconv.Atoi(fields[2])
+	if err != nil || uid < 0 {
+		return localUserIdentity{}, fmt.Errorf("用户 %s 的 UID 无效", userName)
+	}
+	gid, err := strconv.Atoi(fields[3])
+	if err != nil || gid < 0 {
+		return localUserIdentity{}, fmt.Errorf("用户 %s 的 GID 无效", userName)
+	}
+	return localUserIdentity{Name: userName, UID: uid, GID: gid, UIDText: fields[2], GIDText: fields[3], Home: fields[5]}, nil
+}
+
+// getentPasswd 通过 getent 查询单个用户的 passwd 记录，返回首行。validateUserName 已
+// 限制 userName 字符集，作为独立 argv 传入，无注入风险。
+func getentPasswd(userName string) (string, bool) {
+	if _, err := exec.LookPath("getent"); err != nil {
+		return "", false
+	}
+	out, err := exec.Command("getent", "passwd", userName).Output()
+	if err != nil {
+		return "", false
+	}
+	line := strings.TrimRight(string(out), "\n")
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+	if line == "" {
+		return "", false
+	}
+	return line, true
 }
 
 func lookupLocalUser(userName string) (uid string, home string, err error) {
@@ -576,7 +694,7 @@ func runUserSystemctlQuiet(userName string, args ...string) error {
 		return runQuietLabel("执行用户 "+userName+" 的 systemd 命令", "runuser", runArgs...)
 	}
 	if _, err := exec.LookPath("sudo"); err == nil {
-		sudoArgs := []string{"-H", "-u", userName, "env"}
+		sudoArgs := []string{"-n", "-H", "-u", userName, "env"}
 		sudoArgs = append(sudoArgs, env...)
 		sudoArgs = append(sudoArgs, "systemctl")
 		sudoArgs = append(sudoArgs, systemctlArgs...)
@@ -601,6 +719,17 @@ func validPort(port int, field string) error {
 	return nil
 }
 
+func validateTestURL(raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("代理测试地址不能为空")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("代理测试地址必须是 http(s) URL：%s", raw)
+	}
+	return nil
+}
+
 func validateProxyHost(host string) error {
 	if strings.TrimSpace(host) == "" {
 		return fmt.Errorf("代理监听地址不能为空")
@@ -609,6 +738,11 @@ func validateProxyHost(host string) error {
 		return fmt.Errorf("代理监听地址包含非法字符：%s", host)
 	}
 	if ip := net.ParseIP(host); ip != nil {
+		// 本地 HTTP/SOCKS 入站没有认证；绑定到非环回地址会把它暴露成开放代理。
+		// 默认只允许环回，确需对外监听时须显式设置 XRAY_PROXY_ALLOW_PUBLIC_BIND=1。
+		if !ip.IsLoopback() && !envBool("XRAY_PROXY_ALLOW_PUBLIC_BIND", false) {
+			return fmt.Errorf("代理监听地址 %s 非环回地址：无认证入站对外监听会形成开放代理；如确需，请设置 XRAY_PROXY_ALLOW_PUBLIC_BIND=1", host)
+		}
 		return nil
 	}
 	if !regexp.MustCompile(`^[A-Za-z0-9.-]+$`).MatchString(host) {

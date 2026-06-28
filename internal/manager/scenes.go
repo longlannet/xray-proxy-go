@@ -1,8 +1,10 @@
 package manager
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -26,29 +28,36 @@ func hasEnabledScene(st *Store) bool {
 	return st.SceneEnabled[SceneGlobal] || st.SceneEnabled[SceneDev] || st.SceneEnabled[SceneTelegram]
 }
 
+// applySavedScenes 按状态文件逐场景应用或恢复代理设置。这里采用尽力而为策略：
+// 单个场景失败不会中断其余场景，所有错误聚合后一并返回。这样可避免例如开发代理
+// 目标用户配置错误时，连带阻塞全局/电报代理在开机恢复时的应用。
 func (a *App) applySavedScenes(st *Store) error {
+	var errs []error
 	for _, scene := range []Scene{SceneGlobal, SceneDev, SceneTelegram} {
 		if st.SceneEnabled[scene] {
 			if err := a.applyScene(scene); err != nil {
-				return err
+				errs = append(errs, fmt.Errorf("%s应用失败：%w", sceneName(scene), err))
+				continue
 			}
 			if scene == SceneTelegram {
 				targets, err := a.telegramTargets(st, false)
 				if err != nil {
-					return err
+					errs = append(errs, fmt.Errorf("%s目标解析失败：%w", sceneName(scene), err))
+					continue
 				}
 				st.TelegramTargets = canonicalTelegramTargetNames(targets)
 			}
 		} else {
 			if err := a.restoreScene(scene); err != nil {
-				return err
+				errs = append(errs, fmt.Errorf("%s恢复失败：%w", sceneName(scene), err))
+				continue
 			}
 			if scene == SceneTelegram {
 				st.TelegramTargets = nil
 			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (a *App) reloadIfEnabled(st *Store) error {
@@ -83,6 +92,7 @@ func (a *App) setSceneWithStore(st *Store, scene Scene, enabled bool) error {
 	}
 	if enabled {
 		st.SceneEnabled[scene] = true
+		// syncXrayServiceForStore 已写配置、校验并启动核心服务，无需再次 startXrayService。
 		if err := a.syncXrayServiceForStore(st); err != nil {
 			a.rollbackSceneState(st, scene, old)
 			return err
@@ -93,10 +103,6 @@ func (a *App) setSceneWithStore(st *Store, scene Scene, enabled bool) error {
 		}
 		if scene == SceneTelegram {
 			st.TelegramTargets = canonicalTelegramTargetNames(telegramTargets)
-		}
-		if err := a.startXrayService(); err != nil {
-			a.rollbackSceneState(st, scene, old)
-			return err
 		}
 	} else {
 		if err := a.restoreScene(scene); err != nil {
@@ -129,10 +135,7 @@ func (a *App) syncXrayServiceForStore(st *Store) error {
 	if !hasEnabledScene(st) {
 		return a.stopXrayService()
 	}
-	if err := a.writeXrayConfig(st); err != nil {
-		return err
-	}
-	if err := a.checkXrayConfig(); err != nil {
+	if err := a.writeCheckedXrayConfig(st); err != nil {
 		return err
 	}
 	return a.startXrayService()
@@ -145,7 +148,9 @@ func (a *App) rollbackSceneState(st *Store, scene Scene, old bool) {
 	} else {
 		_ = a.restoreScene(scene)
 	}
-	_ = a.syncXrayServiceForStore(st)
+	if err := a.syncXrayServiceForStore(st); err != nil {
+		fmt.Printf("警告：场景回滚后同步核心服务失败，服务可能处于降级状态：%v\n", err)
+	}
 }
 
 func (a *App) stopXrayIfIdle(st *Store) error {
@@ -195,6 +200,10 @@ func (a *App) restoreScene(scene Scene) error {
 }
 
 func (a *App) applyGlobal() error {
+	// 这里用 %q 给 shell / apt 配置值加引号。代理地址由 ProxyHost（validateProxyHost
+	// 限定为 IP 或 [A-Za-z0-9.-]）和已校验端口拼成，不含 shell 元字符，因此 %q 的
+	// Go 双引号语义在此等价于安全引用；如果未来放宽 ProxyHost 字符集，需改用严格的
+	// shell 引用。
 	content := fmt.Sprintf("# 由 xray-proxy-go 管理\nexport http_proxy=%q\nexport https_proxy=%q\nexport all_proxy=%q\nexport HTTP_PROXY=%q\nexport HTTPS_PROXY=%q\nexport ALL_PROXY=%q\n", a.cfg.HTTPAddr(SceneGlobal), a.cfg.HTTPAddr(SceneGlobal), a.cfg.GlobalSocksAddr(), a.cfg.HTTPAddr(SceneGlobal), a.cfg.HTTPAddr(SceneGlobal), a.cfg.GlobalSocksAddr())
 	if err := writeFileAtomic("/etc/profile.d/xray-global-proxy.sh", []byte(content), 0o644); err != nil {
 		return err
@@ -215,16 +224,33 @@ func (a *App) applyDev() error {
 		return err
 	}
 	proxy := a.cfg.HTTPAddr(SceneDev)
-	if err := runAsUser(user, "git", "config", "--global", "http.proxy", proxy); err != nil {
-		return err
+	applied := false
+	if commandExists("git") {
+		if err := runAsUser(user, "git", "config", "--global", "http.proxy", proxy); err != nil {
+			return err
+		}
+		if err := runAsUser(user, "git", "config", "--global", "https.proxy", proxy); err != nil {
+			return err
+		}
+		applied = true
+	} else {
+		fmt.Println("提示：未找到 git，跳过 git 代理设置")
 	}
-	if err := runAsUser(user, "git", "config", "--global", "https.proxy", proxy); err != nil {
-		return err
+	if commandExists("npm") {
+		if err := runAsUser(user, "npm", "config", "set", "proxy", proxy); err != nil {
+			return err
+		}
+		if err := runAsUser(user, "npm", "config", "set", "https-proxy", proxy); err != nil {
+			return err
+		}
+		applied = true
+	} else {
+		fmt.Println("提示：未找到 npm，跳过 npm 代理设置")
 	}
-	if err := runAsUser(user, "npm", "config", "set", "proxy", proxy); err != nil {
-		return err
+	if !applied {
+		return fmt.Errorf("开发代理需要 git 或 npm，但当前都不可用")
 	}
-	return runAsUser(user, "npm", "config", "set", "https-proxy", proxy)
+	return nil
 }
 
 func (a *App) applyTelegram() error {
@@ -266,10 +292,10 @@ func (a *App) applyTelegram() error {
 	}
 	for _, target := range targets {
 		if target.UserMode {
-			runUserSystemctlWarn(target.User, "重启用户级服务 "+target.Service, "try-restart", target.Service)
+			runUserSystemctlWarn(target.User, "重启用户级服务 "+target.Service, "try-restart", "--", target.Service)
 			continue
 		}
-		_ = runQuiet("systemctl", "try-restart", target.Service)
+		_ = runQuiet("systemctl", "try-restart", "--", target.Service)
 	}
 	return nil
 }
@@ -318,11 +344,14 @@ func (a *App) restoreTelegram() error {
 			path, err := a.cfg.UserTelegramDropInPath(target.User, target.Service)
 			if err == nil {
 				_ = os.Remove(path)
+				// 删除清空后的 .service.d 目录；目录非空（有其他 drop-in）时 Remove 失败，忽略。
+				_ = os.Remove(filepath.Dir(path))
 			}
 			userManagers[target.User] = true
 			continue
 		}
 		_ = os.Remove(a.cfg.TelegramDropInPath(target.Service))
+		_ = os.Remove(a.cfg.TelegramDropInDir(target.Service))
 	}
 	_ = runQuietLabel("重新加载 systemd 配置", "systemctl", "daemon-reload")
 	for userName := range userManagers {
@@ -330,10 +359,10 @@ func (a *App) restoreTelegram() error {
 	}
 	for _, target := range targets {
 		if target.UserMode {
-			runUserSystemctlWarn(target.User, "重启用户级服务 "+target.Service, "try-restart", target.Service)
+			runUserSystemctlWarn(target.User, "重启用户级服务 "+target.Service, "try-restart", "--", target.Service)
 			continue
 		}
-		_ = runQuiet("systemctl", "try-restart", target.Service)
+		_ = runQuiet("systemctl", "try-restart", "--", target.Service)
 	}
 	return nil
 }

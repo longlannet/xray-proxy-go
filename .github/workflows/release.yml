@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    env:
+      XRAY_PROXY_MINISIGN_SECRET_KEY: ${{ secrets.XRAY_PROXY_MINISIGN_SECRET_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Test
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build artifacts
+        shell: bash
+        env:
+          XRAY_RELEASE_BASE: https://github.com/XTLS/Xray-core/releases/latest/download
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip
+          mkdir -p dist
+          VERSION="${GITHUB_REF_NAME#v}"
+          LDFLAGS="-s -w -X xray-proxy-go/internal/manager.Version=${VERSION} -X xray-proxy-go/internal/manager.Commit=${GITHUB_SHA}"
+
+          # 下载并用官方 .dgst 校验 Xray，输出解压目录。
+          fetch_xray() {
+            local xrayarch="$1" out="$2" exp
+            curl -fsSL --proto '=https' --proto-redir '=https' -o "$out/xray.zip" \
+              "${XRAY_RELEASE_BASE}/Xray-linux-${xrayarch}.zip"
+            curl -fsSL --proto '=https' --proto-redir '=https' -o "$out/xray.zip.dgst" \
+              "${XRAY_RELEASE_BASE}/Xray-linux-${xrayarch}.zip.dgst"
+            exp="$(grep -iE 'sha2-?256' "$out/xray.zip.dgst" | grep -oiE '[0-9a-f]{64}' | head -n1)"
+            [[ "$exp" =~ ^[0-9a-f]{64}$ ]] || { echo "bad Xray .dgst for ${xrayarch}"; exit 1; }
+            echo "${exp}  ${out}/xray.zip" | sha256sum -c -
+            unzip -oq "$out/xray.zip" -d "$out/x"
+          }
+
+          build_one() {
+            local goarch="$1" goarm="$2" name="$3" xrayarch="$4" stage pkg
+            stage="$(mktemp -d)"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" GOARM="$goarm" \
+              go build -trimpath -ldflags="$LDFLAGS" -o "$stage/xray-proxy" ./cmd/xray-proxy
+            # 仅含管理程序的二进制包。
+            tar -C "$stage" -czf "dist/xray-proxy_linux_${name}.tar.gz" xray-proxy
+            # 自包含离线整合包：顶层目录内含 install.sh + 管理程序 + Xray + geo + NOTICE。
+            # 解压后 `cd <目录> && sudo ./install.sh` 即可离线安装。
+            pkg="xray-proxy_bundle_linux_${name}"
+            mkdir -p "$stage/$pkg"
+            install -m 755 "$stage/xray-proxy" "$stage/$pkg/xray-proxy"
+            install -m 755 install.sh "$stage/$pkg/install.sh"
+            install -m 644 NOTICE "$stage/$pkg/NOTICE"
+            fetch_xray "$xrayarch" "$stage"
+            install -m 755 "$stage/x/xray" "$stage/$pkg/xray"
+            install -m 644 "$stage/x/geoip.dat" "$stage/$pkg/geoip.dat"
+            install -m 644 "$stage/x/geosite.dat" "$stage/$pkg/geosite.dat"
+            # XTLS 发布包内含 LICENSE 时一并打包，满足 MPL-2.0 的许可证随附要求。
+            if [[ -f "$stage/x/LICENSE" ]]; then
+              install -m 644 "$stage/x/LICENSE" "$stage/$pkg/LICENSE-Xray"
+            fi
+            tar -C "$stage" -czf "dist/${pkg}.tar.gz" "$pkg"
+            rm -rf "$stage"
+          }
+
+          build_one amd64 "" amd64 64
+          build_one arm64 "" arm64 arm64-v8a
+          build_one 386   "" 386   32
+          build_one arm   7  armv7 arm32-v7a
+          (cd dist && sha256sum xray-proxy_*.tar.gz > checksums.txt)
+      - name: Sign artifacts
+        if: ${{ env.XRAY_PROXY_MINISIGN_SECRET_KEY != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y minisign
+          cleanup() {
+            rm -f minisign.key
+          }
+          trap cleanup EXIT
+          printf '%s' "$XRAY_PROXY_MINISIGN_SECRET_KEY" > minisign.key
+          chmod 600 minisign.key
+          # 签名 checksums.txt（联机安装校验用）。
+          minisign -S -W -m dist/checksums.txt -s minisign.key -x dist/checksums.txt.minisig
+          # 逐个签名离线整合包（离线安装用内置公钥直接验 .minisig）。
+          for b in dist/xray-proxy_bundle_linux_*.tar.gz; do
+            minisign -S -W -m "$b" -s minisign.key -x "$b.minisig"
+          done
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          files: dist/*
+          generate_release_notes: true

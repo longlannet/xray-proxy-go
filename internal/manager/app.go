@@ -40,6 +40,9 @@ func (a *App) Run(args []string) error {
 	case "help", "-h", "--help":
 		a.help()
 		return nil
+	case "version", "--version", "-v":
+		fmt.Printf("xray-proxy %s\n", VersionString())
+		return nil
 	default:
 		return fmt.Errorf("未知命令：%s", args[0])
 	}
@@ -56,8 +59,15 @@ func (a *App) help() {
 	fmt.Println("  xray-proxy node list               查看节点")
 	fmt.Println("  xray-proxy node add '节点链接' '备注'")
 	fmt.Println("  xray-proxy node import '订阅链接'")
-	fmt.Println("  xray-proxy node auto [范围]         自动选择节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)")
-	fmt.Println("  xray-proxy node use '节点ID' [范围] 使用指定节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)")
+	fmt.Println("  xray-proxy node rename '节点ID' '新备注'")
+	fmt.Println("  xray-proxy node remove '节点ID'      删除节点（别名：delete）")
+	fmt.Println("  xray-proxy node test               对所有节点做 TCP 连通性测速")
+	fmt.Println("  xray-proxy node auto [范围]         测速后自动选择最快节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)/全部(all)")
+	fmt.Println("  xray-proxy node use '节点ID' [范围] 使用指定节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)/全部(all)")
+	fmt.Println("  xray-proxy test                    通过全局代理测试连通性")
+	fmt.Println("  xray-proxy status                  查看状态")
+	fmt.Println("  xray-proxy version                 查看版本")
+	fmt.Println("  xray-proxy uninstall               卸载 systemd 服务（保留数据目录）")
 }
 
 func (a *App) menu() error {
@@ -82,7 +92,11 @@ func (a *App) menu() error {
 		fmt.Println("7. 查看状态")
 		fmt.Println("8. 卸载")
 		fmt.Println("9. 退出")
-		choice := ask("请输入选项 [1-9]: ")
+		choice, ok := ask("请输入选项 [1-9]: ")
+		if !ok {
+			fmt.Println()
+			return nil
+		}
 		switch choice {
 		case "1":
 			if err := a.install("", true); err != nil {
@@ -129,6 +143,10 @@ func parseInstallArgs(args []string) (raw string, promptNode bool, err error) {
 		case "--skip-node", "--no-node":
 			promptNode = false
 		default:
+			// 拒绝未知的 - 开头选项，避免把拼错的 flag 当成节点链接静默处理。
+			if strings.HasPrefix(arg, "-") {
+				return "", false, fmt.Errorf("未知选项：%s（可用：--skip-node）", arg)
+			}
 			if raw != "" {
 				return "", false, fmt.Errorf("初始化命令只接受一个节点链接参数")
 			}
@@ -143,7 +161,7 @@ func (a *App) install(raw string, promptNode bool) error {
 		return err
 	}
 	if raw == "" && promptNode {
-		raw = ask("请输入节点链接（VLESS / VMess / Trojan / Shadowsocks，可留空跳过）: ")
+		raw, _ = ask("请输入节点链接（VLESS / VMess / Trojan / Shadowsocks，可留空跳过）: ")
 	}
 	if err := a.ensureCoreDirs(); err != nil {
 		return err
@@ -168,10 +186,7 @@ func (a *App) install(raw string, promptNode bool) error {
 			if len(st.Nodes) == 0 {
 				return fmt.Errorf("已有场景处于开启状态，但没有可用节点")
 			}
-			if err := a.writeXrayConfig(st); err != nil {
-				return err
-			}
-			if err := a.checkXrayConfig(); err != nil {
+			if err := a.writeCheckedXrayConfig(st); err != nil {
 				return err
 			}
 		}
@@ -182,8 +197,10 @@ func (a *App) install(raw string, promptNode bool) error {
 			return err
 		}
 		if hasEnabledScene(st) {
+			// applySavedScenes 为尽力而为：单个场景失败不应阻止其余场景的核心服务启动
+			// 与状态持久化，否则一个场景出错会连带导致 Xray 根本不启动。
 			if err := a.applySavedScenes(st); err != nil {
-				return err
+				fmt.Println("警告：部分场景应用失败，将继续启动核心服务：", err)
 			}
 			if err := a.saveStore(st); err != nil {
 				return err
@@ -259,22 +276,21 @@ func (a *App) bootRestore() error {
 			return err
 		}
 		if !hasEnabledScene(st) {
+			// 尽力而为：即使某个场景的清理失败，也要保存状态并按需停止核心服务。
 			if err := a.applySavedScenes(st); err != nil {
-				return err
+				fmt.Println("警告：部分场景清理失败：", err)
 			}
 			if err := a.saveStore(st); err != nil {
 				return err
 			}
 			return a.stopXrayIfIdle(st)
 		}
-		if err := a.writeXrayConfig(st); err != nil {
+		if err := a.writeCheckedXrayConfig(st); err != nil {
 			return err
 		}
-		if err := a.checkXrayConfig(); err != nil {
-			return err
-		}
+		// 尽力而为：单个场景应用失败不应阻止核心服务在开机时启动。
 		if err := a.applySavedScenes(st); err != nil {
-			return err
+			fmt.Println("警告：部分场景应用失败，将继续启动核心服务：", err)
 		}
 		if err := a.saveStore(st); err != nil {
 			return err
@@ -297,10 +313,10 @@ func (a *App) uninstall() error {
 	if err := a.setScene(SceneGlobal, false); err != nil {
 		errs = append(errs, fmt.Errorf("关闭全局代理失败：%w", err))
 	}
-	if err := runQuietLabel("停止并禁用 Xray 主服务", "systemctl", "disable", "--now", a.cfg.SystemdService); err != nil {
+	if err := runQuietLabel("停止并禁用 Xray 主服务", "systemctl", "disable", "--now", "--", a.cfg.SystemdService); err != nil {
 		errs = append(errs, err)
 	}
-	if err := runQuietLabel("停止并禁用开机恢复服务", "systemctl", "disable", "--now", a.cfg.RestoreService); err != nil {
+	if err := runQuietLabel("停止并禁用开机恢复服务", "systemctl", "disable", "--now", "--", a.cfg.RestoreService); err != nil {
 		errs = append(errs, err)
 	}
 	if err := removeIfExists("/etc/systemd/system/" + a.cfg.SystemdService); err != nil {

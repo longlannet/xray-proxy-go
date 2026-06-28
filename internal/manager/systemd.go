@@ -39,8 +39,8 @@ RestrictRealtime=true
 LockPersonality=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -56,8 +56,13 @@ func (a *App) prepareXrayServiceRuntime() error {
 	if err != nil {
 		return err
 	}
-	if a.cfg.XrayServiceUser == "root" || identity.GID == 0 {
+	if a.cfg.XrayServiceUser == "root" {
 		return nil
+	}
+	// 非 root 服务用户却以 root(GID 0) 为主组时，无法通过"组可读"安全地授予配置访问；
+	// 直接报错而不是静默跳过锁定（那会让服务读不到自己的配置）。
+	if identity.GID == 0 {
+		return fmt.Errorf("服务用户 %s 的主组为 root(GID 0)，无法安全授予配置读取权限，请为其分配独立用户组", a.cfg.XrayServiceUser)
 	}
 	if err := os.Chown(a.cfg.CoreDir, 0, identity.GID); err != nil {
 		return err
@@ -146,19 +151,19 @@ WantedBy=multi-user.target
 	if err := runQuietLabel("重新加载 systemd 配置", "systemctl", "daemon-reload"); err != nil {
 		return err
 	}
-	return runQuietLabel("启用开机恢复服务", "systemctl", "enable", a.cfg.RestoreService)
+	return runQuietLabel("启用开机恢复服务", "systemctl", "enable", "--", a.cfg.RestoreService)
 }
 
 func (a *App) startXrayService() error {
 	if err := a.installXrayService(); err != nil {
 		return err
 	}
-	if err := runQuietLabel("启用 Xray 主服务", "systemctl", "enable", a.cfg.SystemdService); err != nil {
+	if err := runQuietLabel("启用 Xray 主服务", "systemctl", "enable", "--", a.cfg.SystemdService); err != nil {
 		return err
 	}
-	return runQuietLabel("重启 Xray 主服务", "systemctl", "restart", a.cfg.SystemdService)
+	return runQuietLabel("重启 Xray 主服务", "systemctl", "restart", "--", a.cfg.SystemdService)
 }
 func (a *App) stopXrayService() error {
-	_ = runQuiet("systemctl", "stop", a.cfg.SystemdService)
-	return runQuietLabel("禁用 Xray 主服务", "systemctl", "disable", a.cfg.SystemdService)
+	_ = runQuiet("systemctl", "stop", "--", a.cfg.SystemdService)
+	return runQuietLabel("禁用 Xray 主服务", "systemctl", "disable", "--", a.cfg.SystemdService)
 }

@@ -3,8 +3,10 @@ package manager
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,11 +32,28 @@ func (a *App) loadStore() (*Store, error) {
 	st := newStore()
 	if len(b) > 0 {
 		if err := json.Unmarshal(b, st); err != nil {
-			return nil, err
+			if recovered, ok := a.loadStoreBackup(); ok {
+				fmt.Printf("警告：状态文件损坏，已从备份恢复：%s\n", path)
+				return recovered, nil
+			}
+			return nil, fmt.Errorf("状态文件损坏且无法从备份恢复（%s）：%w", path, err)
 		}
 	}
 	normalizeStore(st)
 	return st, nil
+}
+
+func (a *App) loadStoreBackup() (*Store, bool) {
+	b, err := os.ReadFile(a.cfg.StoreBackupPath())
+	if err != nil || len(b) == 0 {
+		return nil, false
+	}
+	st := newStore()
+	if err := json.Unmarshal(b, st); err != nil {
+		return nil, false
+	}
+	normalizeStore(st)
+	return st, true
 }
 
 func normalizeStore(st *Store) {
@@ -55,7 +74,13 @@ func (a *App) saveStore(st *Store) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(a.cfg.StorePath(), append(b, '\n'), 0o600)
+	data := append(b, '\n')
+	if err := writeFileAtomic(a.cfg.StorePath(), data, 0o600); err != nil {
+		return err
+	}
+	// 尽力保存一份备份，供状态文件损坏时恢复；备份失败不影响主流程。
+	_ = writeFileAtomic(a.cfg.StoreBackupPath(), data, 0o600)
+	return nil
 }
 
 func (st *Store) findNode(id string) *Node {
@@ -93,6 +118,11 @@ func (st *Store) selectedNodeID(scene Scene) string {
 	return st.firstNodeID()
 }
 
+// nodeIDCounter 保证同一进程内连续生成的节点 ID 唯一，避免在订阅导入等紧循环里
+// 因 time.Now() 分辨率不足或时钟回拨而产生重复 ID。
+var nodeIDCounter uint64
+
 func newNodeID() string {
-	return "node-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	seq := atomic.AddUint64(&nodeIDCounter, 1)
+	return fmt.Sprintf("node-%s-%s", strconv.FormatInt(time.Now().UnixNano(), 36), strconv.FormatUint(seq, 36))
 }

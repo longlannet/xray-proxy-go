@@ -1,0 +1,42 @@
+# xray-proxy-go Notice
+
+## 中文
+
+- 项目名称：xray-proxy-go
+- 原始仓库：https://github.com/longlannet/xray-proxy-go
+- 许可证：MIT License
+
+本项目的离线整合包（`xray-proxy_bundle_linux_*.tar.gz`）中除了本项目的管理程序
+`xray-proxy`，还**再分发**了以下第三方组件，其版权与许可证归各自项目所有：
+
+- **Xray-core**（可执行文件 `xray` 及 `geoip.dat`、`geosite.dat`）
+  - 项目地址：https://github.com/XTLS/Xray-core
+  - 许可证：Mozilla Public License 2.0 (MPL-2.0)
+  - `geoip.dat` / `geosite.dat` 数据文件来自 https://github.com/v2fly/domain-list-community
+    与 https://github.com/Loyalsoldier/v2ray-rules-dat 等上游，遵循其各自许可证。
+
+再分发本整合包时，必须保留本声明，并遵守上述各组件的许可证要求。MPL-2.0 为文件级
+copyleft：未修改 Xray-core 源码、仅以原样再分发其二进制时，需保留其版权与许可证声明；
+如需 Xray-core 源码，请见其原始仓库。
+
+## English
+
+- Project: xray-proxy-go
+- Original repository: https://github.com/longlannet/xray-proxy-go
+- License: MIT License
+
+In addition to this project's own manager binary `xray-proxy`, the offline bundle
+(`xray-proxy_bundle_linux_*.tar.gz`) **redistributes** the following third-party
+components, which remain under their own copyrights and licenses:
+
+- **Xray-core** (the `xray` binary and `geoip.dat`, `geosite.dat`)
+  - Project: https://github.com/XTLS/Xray-core
+  - License: Mozilla Public License 2.0 (MPL-2.0)
+  - The `geoip.dat` / `geosite.dat` data files originate from upstream projects such
+    as https://github.com/v2fly/domain-list-community and
+    https://github.com/Loyalsoldier/v2ray-rules-dat under their respective licenses.
+
+When redistributing this bundle you must keep this notice and comply with the licenses
+of the bundled components. MPL-2.0 is a file-level copyleft license; redistributing the
+unmodified Xray-core binary requires preserving its copyright and license notices. Source
+for Xray-core is available at its original repository.

@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -56,7 +58,7 @@ func (a *App) addNode(st *Store, raw, name, scope string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("节点链接不能为空")
 	}
-	pn, err := parseNode(raw, a.cfg)
+	pn, err := parseNode(raw)
 	if err != nil {
 		return "", err
 	}
@@ -71,6 +73,10 @@ func (a *App) addNode(st *Store, raw, name, scope string) (string, error) {
 			}
 		}
 		return old.ID, nil
+	}
+	// 仅在真正新增节点时提示一次，避免去重再加或批量导入时重复刷屏。
+	if pn.Protocol == "ss" && strings.Contains(raw, "plugin=") {
+		fmt.Printf("警告：节点 %s 含 SS plugin 参数，本程序不支持插件（obfs/v2ray-plugin 等），生成的配置可能无法连通\n", firstNonEmpty(pn.Name, "ss"))
 	}
 	id := newNodeID()
 	if name == "" {
@@ -91,22 +97,22 @@ func (a *App) addNode(st *Store, raw, name, scope string) (string, error) {
 	return id, nil
 }
 
-func parseNode(raw string, cfg Config) (*parsedNode, error) {
+func parseNode(raw string) (*parsedNode, error) {
 	switch protocolFromURL(raw) {
 	case "vless":
-		return parseVLESS(raw, cfg)
+		return parseVLESS(raw)
 	case "vmess":
-		return parseVMess(raw, cfg)
+		return parseVMess(raw)
 	case "trojan":
-		return parseTrojan(raw, cfg)
+		return parseTrojan(raw)
 	case "ss":
-		return parseSS(raw, cfg)
+		return parseSS(raw)
 	default:
 		return nil, fmt.Errorf("不支持的节点协议：%s", protocolFromURL(raw))
 	}
 }
 
-func parseVLESS(raw string, cfg Config) (*parsedNode, error) {
+func parseVLESS(raw string) (*parsedNode, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, err
@@ -130,7 +136,7 @@ func parseVLESS(raw string, cfg Config) (*parsedNode, error) {
 	if security == "" {
 		security = "none"
 	}
-	stream := map[string]any{"network": network, "security": security, "sockopt": map[string]any{"mark": cfg.OutboundMark}}
+	stream := map[string]any{"network": network, "security": security}
 	if security == "tls" {
 		sni := q.Get("sni")
 		if sni == "" {
@@ -142,6 +148,11 @@ func parseVLESS(raw string, cfg Config) (*parsedNode, error) {
 		stream["tlsSettings"] = map[string]any{"serverName": sni}
 	}
 	if security == "reality" {
+		// reality 必须带 publicKey(pbk)，否则 Xray 会拒绝整份配置；在录入时就拦截，
+		// 避免一个坏节点导致所有已启用场景的配置检查一起失败。
+		if q.Get("pbk") == "" {
+			return nil, fmt.Errorf("VLESS reality 节点缺少 publicKey(pbk)")
+		}
 		sni := q.Get("sni")
 		if sni == "" {
 			sni = q.Get("serverName")
@@ -150,10 +161,10 @@ func parseVLESS(raw string, cfg Config) (*parsedNode, error) {
 	}
 	addTransport(stream, network, q)
 	out := map[string]any{"tag": "", "protocol": "vless", "settings": map[string]any{"vnext": []any{map[string]any{"address": u.Hostname(), "port": port, "users": []any{map[string]any{"id": u.User.Username(), "encryption": firstNonEmpty(q.Get("encryption"), "none"), "flow": q.Get("flow")}}}}}, "streamSettings": stream}
-	return &parsedNode{Protocol: "vless", Name: remark(raw, "vless-"+u.Hostname()), EndpointHost: u.Hostname(), EndpointPort: port, Outbound: out}, nil
+	return &parsedNode{Protocol: "vless", Name: sanitizeNodeName(remark(raw, "vless-"+u.Hostname())), EndpointHost: u.Hostname(), EndpointPort: port, Outbound: out}, nil
 }
 
-func parseVMess(raw string, cfg Config) (*parsedNode, error) {
+func parseVMess(raw string) (*parsedNode, error) {
 	payload := strings.TrimPrefix(raw, "vmess://")
 	payload = strings.Split(payload, "#")[0]
 	b, err := decodeBase64URL(payload)
@@ -178,17 +189,17 @@ func parseVMess(raw string, cfg Config) (*parsedNode, error) {
 	if stringVal(v, "tls") == "tls" {
 		security = "tls"
 	}
-	stream := map[string]any{"network": network, "security": security, "sockopt": map[string]any{"mark": cfg.OutboundMark}}
+	stream := map[string]any{"network": network, "security": security}
 	if security == "tls" {
 		stream["tlsSettings"] = map[string]any{"serverName": firstNonEmpty(stringVal(v, "sni"), addr)}
 	}
 	q := url.Values{"host": []string{stringVal(v, "host")}, "path": []string{stringVal(v, "path")}, "serviceName": []string{stringVal(v, "serviceName")}}
 	addTransport(stream, network, q)
 	out := map[string]any{"tag": "", "protocol": "vmess", "settings": map[string]any{"vnext": []any{map[string]any{"address": addr, "port": port, "users": []any{map[string]any{"id": id, "alterId": intVal(v, "aid"), "security": firstNonEmpty(stringVal(v, "scy"), "auto")}}}}}, "streamSettings": stream}
-	return &parsedNode{Protocol: "vmess", Name: firstNonEmpty(stringVal(v, "ps"), "vmess-"+addr), EndpointHost: addr, EndpointPort: port, Outbound: out}, nil
+	return &parsedNode{Protocol: "vmess", Name: sanitizeNodeName(firstNonEmpty(stringVal(v, "ps"), "vmess-"+addr)), EndpointHost: addr, EndpointPort: port, Outbound: out}, nil
 }
 
-func parseTrojan(raw string, cfg Config) (*parsedNode, error) {
+func parseTrojan(raw string) (*parsedNode, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, err
@@ -203,16 +214,26 @@ func parseTrojan(raw string, cfg Config) (*parsedNode, error) {
 	q := u.Query()
 	network := firstNonEmpty(q.Get("type"), q.Get("network"), "tcp")
 	security := firstNonEmpty(q.Get("security"), "tls")
-	stream := map[string]any{"network": network, "security": security, "sockopt": map[string]any{"mark": cfg.OutboundMark}}
+	stream := map[string]any{"network": network, "security": security}
 	if security == "tls" {
 		stream["tlsSettings"] = map[string]any{"serverName": firstNonEmpty(q.Get("sni"), q.Get("peer"), u.Hostname())}
 	}
 	addTransport(stream, network, q)
-	out := map[string]any{"tag": "", "protocol": "trojan", "settings": map[string]any{"servers": []any{map[string]any{"address": u.Hostname(), "port": port, "password": u.User.Username()}}}, "streamSettings": stream}
-	return &parsedNode{Protocol: "trojan", Name: remark(raw, "trojan-"+u.Hostname()), EndpointHost: u.Hostname(), EndpointPort: port, Outbound: out}, nil
+	out := map[string]any{"tag": "", "protocol": "trojan", "settings": map[string]any{"servers": []any{map[string]any{"address": u.Hostname(), "port": port, "password": trojanPassword(u)}}}, "streamSettings": stream}
+	return &parsedNode{Protocol: "trojan", Name: sanitizeNodeName(remark(raw, "trojan-"+u.Hostname())), EndpointHost: u.Hostname(), EndpointPort: port, Outbound: out}, nil
 }
 
-func parseSS(raw string, cfg Config) (*parsedNode, error) {
+// trojanPassword 还原 Trojan 链接中的完整密码。url.Userinfo 会按第一个冒号把
+// userinfo 拆成用户名/密码，而 Trojan 的整段 userinfo 都是密码，因此需要把两段拼回。
+func trojanPassword(u *url.URL) string {
+	password := u.User.Username()
+	if pw, ok := u.User.Password(); ok {
+		password += ":" + pw
+	}
+	return password
+}
+
+func parseSS(raw string) (*parsedNode, error) {
 	body := strings.TrimPrefix(strings.TrimPrefix(raw, "ss://"), "shadowsocks://")
 	body = strings.Split(strings.Split(body, "#")[0], "?")[0]
 	var userinfo, hostport string
@@ -256,8 +277,8 @@ func parseSS(raw string, cfg Config) (*parsedNode, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]any{"tag": "", "protocol": "shadowsocks", "settings": map[string]any{"servers": []any{map[string]any{"address": addr, "port": port, "method": up[0], "password": up[1]}}}, "streamSettings": map[string]any{"sockopt": map[string]any{"mark": cfg.OutboundMark}}}
-	return &parsedNode{Protocol: "ss", Name: remark(raw, "ss-"+addr), EndpointHost: addr, EndpointPort: port, Outbound: out}, nil
+	out := map[string]any{"tag": "", "protocol": "shadowsocks", "settings": map[string]any{"servers": []any{map[string]any{"address": addr, "port": port, "method": up[0], "password": up[1]}}}}
+	return &parsedNode{Protocol: "ss", Name: sanitizeNodeName(remark(raw, "ss-"+addr)), EndpointHost: addr, EndpointPort: port, Outbound: out}, nil
 }
 
 func parseNodePort(raw, protocol string) (int, error) {
@@ -286,6 +307,22 @@ func remark(raw, fallback string) string {
 		}
 	}
 	return fallback
+}
+
+// sanitizeNodeName 移除节点名中的控制字符（含 ESC/BEL/CR/LF 等，字节 < 0x20 及 0x7f），
+// 防止攻击者通过订阅节点名注入终端转义序列，污染 root 操作员的终端输出。
+func sanitizeNodeName(s string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+	cleaned = strings.TrimSpace(cleaned)
+	if cleaned == "" {
+		return "node"
+	}
+	return cleaned
 }
 
 func firstNonEmpty(values ...string) string {
@@ -408,12 +445,17 @@ func (a *App) nodeMenu() error {
 		fmt.Println("10. 修改节点备注")
 		fmt.Println("11. 删除节点")
 		fmt.Println("12. 返回")
-		switch ask("请输入选项 [1-12]: ") {
+		choice, ok := ask("请输入选项 [1-12]: ")
+		if !ok {
+			fmt.Println()
+			return nil
+		}
+		switch choice {
 		case "1":
 			_ = a.listNodes(st)
 		case "2":
-			raw := ask("节点链接: ")
-			name := ask("备注名: ")
+			raw, _ := ask("节点链接: ")
+			name, _ := ask("备注名: ")
 			if err := a.withLockedStoreRoot(func(st *Store) error {
 				_, err := a.addNode(st, raw, name, "default")
 				if err == nil {
@@ -427,7 +469,7 @@ func (a *App) nodeMenu() error {
 				fmt.Println(err)
 			}
 		case "3":
-			sub := ask("订阅链接: ")
+			sub, _ := ask("订阅链接: ")
 			if err := a.withLockedStoreRoot(func(st *Store) error { return a.importSubscription(st, sub) }); err != nil {
 				fmt.Println(err)
 			}
@@ -440,33 +482,33 @@ func (a *App) nodeMenu() error {
 				fmt.Println(err)
 			}
 		case "6":
-			id := ask("节点 ID: ")
+			id, _ := ask("节点 ID: ")
 			if err := a.useNodeWithLock(id, "default"); err != nil {
 				fmt.Println(err)
 			}
 		case "7":
-			id := ask("节点 ID: ")
+			id, _ := ask("节点 ID: ")
 			if err := a.useNodeWithLock(id, string(SceneGlobal)); err != nil {
 				fmt.Println(err)
 			}
 		case "8":
-			id := ask("节点 ID: ")
+			id, _ := ask("节点 ID: ")
 			if err := a.useNodeWithLock(id, string(SceneDev)); err != nil {
 				fmt.Println(err)
 			}
 		case "9":
-			id := ask("节点 ID: ")
+			id, _ := ask("节点 ID: ")
 			if err := a.useNodeWithLock(id, string(SceneTelegram)); err != nil {
 				fmt.Println(err)
 			}
 		case "10":
-			id := ask("节点 ID: ")
-			name := ask("新备注: ")
+			id, _ := ask("节点 ID: ")
+			name, _ := ask("新备注: ")
 			if err := a.withLockedStoreRoot(func(st *Store) error { return a.renameNode(st, id, name) }); err != nil {
 				fmt.Println(err)
 			}
 		case "11":
-			id := ask("节点 ID: ")
+			id, _ := ask("节点 ID: ")
 			if err := a.withLockedStoreRoot(func(st *Store) error { return a.removeNode(st, id) }); err != nil {
 				fmt.Println(err)
 			}
@@ -527,8 +569,9 @@ func (a *App) removeNode(st *Store, id string) error {
 		st.SceneEnabled[SceneGlobal] = false
 		st.SceneEnabled[SceneDev] = false
 		st.SceneEnabled[SceneTelegram] = false
+		// 尽力而为：即使场景清理部分失败，也要停掉核心服务并保存已关闭的状态。
 		if err := a.applySavedScenes(st); err != nil {
-			return err
+			fmt.Println("警告：删除最后一个节点后清理场景部分失败：", err)
 		}
 		if err := a.stopXrayService(); err != nil {
 			return err
@@ -601,7 +644,9 @@ func (a *App) importSubscription(st *Store, sub string) error {
 	default:
 		return fmt.Errorf("订阅链接必须是 https 地址")
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	allowHTTP := envBool("XRAY_PROXY_ALLOW_HTTP_SUBSCRIPTION", false)
+	allowPrivate := envBool("XRAY_PROXY_ALLOW_PRIVATE_SUBSCRIPTION", false)
+	client := subscriptionHTTPClient(allowHTTP, allowPrivate)
 	resp, err := client.Get(sub)
 	if err != nil {
 		return err
@@ -624,18 +669,23 @@ func (a *App) importSubscription(st *Store, sub string) error {
 			urls = extractNodeURLs(string(dec))
 		}
 	}
-	before := len(st.Nodes)
-	accepted := 0
+	added, existing, failed := 0, 0, 0
 	for _, raw := range urls {
-		if _, err := a.addNode(st, raw, "", ""); err == nil {
-			accepted++
+		n0 := len(st.Nodes)
+		if _, err := a.addNode(st, raw, "", ""); err != nil {
+			failed++
+			continue
+		}
+		if len(st.Nodes) > n0 {
+			added++
+		} else {
+			existing++
 		}
 	}
-	added := len(st.Nodes) - before
-	if accepted == 0 {
+	if added == 0 && existing == 0 {
 		return fmt.Errorf("订阅中没有可导入节点")
 	}
-	fmt.Printf("订阅导入完成：新增 %d 个节点，已存在 %d 个节点\n", added, accepted-added)
+	fmt.Printf("订阅导入完成：新增 %d 个，已存在/重复 %d 个，跳过无效 %d 个\n", added, existing, failed)
 	if !containsString(st.Subscriptions, sub) {
 		st.Subscriptions = append(st.Subscriptions, sub)
 	}
@@ -645,17 +695,72 @@ func (a *App) importSubscription(st *Store, sub string) error {
 	return a.reloadIfEnabled(st)
 }
 
+// extractNodeURLs 从订阅文本中提取节点链接。协议 scheme 前要求一个边界（行首或
+// 空白/引号/括号等），避免把 "xvless://..." 这类词中出现的 scheme 误当成链接。
+// 注意：URL 字符集仍保留逗号，因为部分链接的查询参数（如 ws host 列表）合法含逗号；
+// 订阅标准是按行分隔，逗号拼接属非标准用法。
 func extractNodeURLs(s string) []string {
-	re := regexp.MustCompile(`(?i)(vless|vmess|trojan|ss|shadowsocks)://[^\s<>'"]+`)
-	matches := re.FindAllString(s, -1)
+	re := regexp.MustCompile(`(?i)(?:^|[\s'"<>(){}])((?:vless|vmess|trojan|ss|shadowsocks)://[^\s<>'"]+)`)
+	matches := re.FindAllStringSubmatch(s, -1)
 	urls := make([]string, 0, len(matches))
-	for _, raw := range matches {
-		raw = strings.TrimRight(raw, ".,;，；。)]}>")
+	for _, m := range matches {
+		raw := strings.TrimRight(m[1], ".,;，；。)]}>")
 		if raw != "" {
 			urls = append(urls, raw)
 		}
 	}
 	return urls
+}
+
+// subscriptionHTTPClient 构造抓取订阅用的 HTTP 客户端，带两层 SSRF 防护：
+//  1. CheckRedirect 在每一跳重新校验协议，禁止 https 被重定向降级到非允许协议；
+//  2. Dialer.Control 在 DNS 解析后、连接前校验目标 IP，默认拒绝环回/私网/链路本地/
+//     CGNAT 等非公网地址（含云元数据 169.254.169.254），可防 DNS rebinding。
+//     如确需抓取部署在内网的订阅，设置 XRAY_PROXY_ALLOW_PRIVATE_SUBSCRIPTION=1。
+func subscriptionHTTPClient(allowHTTP, allowPrivate bool) *http.Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	if !allowPrivate {
+		dialer.Control = func(network, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			ip := net.ParseIP(host)
+			if ip == nil {
+				return fmt.Errorf("无法解析订阅目标地址：%s", address)
+			}
+			if !isPublicIP(ip) {
+				return fmt.Errorf("订阅目标指向非公网地址，已拒绝（如确需可设 XRAY_PROXY_ALLOW_PRIVATE_SUBSCRIPTION=1）：%s", host)
+			}
+			return nil
+		}
+	}
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{DialContext: dialer.DialContext},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("订阅重定向次数过多")
+			}
+			if req.URL.Scheme == "https" || (allowHTTP && req.URL.Scheme == "http") {
+				return nil
+			}
+			return fmt.Errorf("订阅重定向到不允许的协议：%s", req.URL.Scheme)
+		},
+	}
+}
+
+// isPublicIP 报告 ip 是否为可路由的公网地址。
+func isPublicIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsPrivate() {
+		return false
+	}
+	// 100.64.0.0/10（CGNAT），不被上面的判定覆盖。
+	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+		return false
+	}
+	return true
 }
 
 func containsString(values []string, want string) bool {
@@ -671,20 +776,35 @@ func (a *App) speedTest(st *Store) error {
 	if len(st.Nodes) == 0 {
 		return fmt.Errorf("没有可测速节点")
 	}
+	// 并发测速，限制并发上限，避免 N 个节点串行各等 5s 超时导致整体阻塞 N*5s。
+	results := make([]SpeedResult, len(st.Nodes))
+	sem := make(chan struct{}, 10)
+	var wg sync.WaitGroup
+	for i := range st.Nodes {
+		wg.Add(1)
+		go func(i int, n Node) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			start := time.Now()
+			err := a.testNode(n)
+			r := SpeedResult{NodeID: n.ID, Target: "节点地址 TCP 连通性", LatencyMS: time.Since(start).Milliseconds(), Success: err == nil, TestedAt: time.Now()}
+			if err != nil {
+				r.Error = err.Error()
+			}
+			results[i] = r
+		}(i, st.Nodes[i])
+	}
+	wg.Wait()
 	current := map[string]bool{}
-	for _, n := range st.Nodes {
+	for i, n := range st.Nodes {
 		current[n.ID] = true
-		start := time.Now()
-		err := a.testNode(n)
-		ms := time.Since(start).Milliseconds()
-		result := SpeedResult{NodeID: n.ID, Target: "节点地址 TCP 连通性", LatencyMS: ms, Success: err == nil, TestedAt: time.Now()}
-		if err != nil {
-			result.Error = err.Error()
-			fmt.Printf("%s 失败：%v\n", n.Name, err)
+		st.SpeedResults[n.ID] = results[i]
+		if results[i].Success {
+			fmt.Printf("%s %dms\n", n.Name, results[i].LatencyMS)
 		} else {
-			fmt.Printf("%s %dms\n", n.Name, ms)
+			fmt.Printf("%s 失败：%s\n", n.Name, results[i].Error)
 		}
-		st.SpeedResults[n.ID] = result
 	}
 	for id := range st.SpeedResults {
 		if !current[id] {
@@ -729,15 +849,16 @@ func (a *App) autoSelect(st *Store, scope string) error {
 			ids = append(ids, n.ID)
 		}
 	}
-	sort.Slice(ids, func(i, j int) bool { return st.SpeedResults[ids[i]].LatencyMS < st.SpeedResults[ids[j]].LatencyMS })
-	for _, id := range ids {
-		if err := a.useNodeInStore(st, id, scope); err != nil {
-			return err
-		}
-		if err := a.saveStore(st); err != nil {
-			return err
-		}
-		return a.reloadIfEnabled(st)
+	if len(ids) == 0 {
+		return fmt.Errorf("没有可用节点")
 	}
-	return fmt.Errorf("没有可用节点")
+	sort.Slice(ids, func(i, j int) bool { return st.SpeedResults[ids[i]].LatencyMS < st.SpeedResults[ids[j]].LatencyMS })
+	// 选延迟最低的可用节点。
+	if err := a.useNodeInStore(st, ids[0], scope); err != nil {
+		return err
+	}
+	if err := a.saveStore(st); err != nil {
+		return err
+	}
+	return a.reloadIfEnabled(st)
 }

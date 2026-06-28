@@ -6,7 +6,24 @@ import (
 	"time"
 )
 
-const Version = "0.2.1"
+// Version 和 Commit 可在构建时通过 -ldflags "-X xray-proxy-go/internal/manager.Version=..."
+// 注入（release 工作流会用 git tag 和 commit 覆盖）；源码直接构建时使用下面的默认值。
+var (
+	Version = "0.3.0"
+	Commit  = ""
+)
+
+// VersionString 返回带可选 commit 短哈希的版本字符串。
+func VersionString() string {
+	if Commit == "" {
+		return Version
+	}
+	short := Commit
+	if len(short) > 12 {
+		short = short[:12]
+	}
+	return Version + " (" + short + ")"
+}
 
 type Scene string
 
@@ -24,18 +41,13 @@ type Config struct {
 	TGSocksPort      int
 	GlobalHTTPPort   int
 	GlobalSocksPort  int
-	TransparentPort  int
-	RedirectPort     int
-	TransparentIPv6  int
-	RedirectIPv6     int
-	TProxyMark       int
-	OutboundMark     int
 	InstallBin       string
 	SystemdService   string
 	RestoreService   string
 	XrayServiceUser  string
 	TGTargetServices []string
 	DevTargetUser    string
+	TestURL          string
 }
 
 func DefaultConfig() Config {
@@ -47,18 +59,13 @@ func DefaultConfig() Config {
 		TGSocksPort:      envIntAny([]string{"TG_SOCKS_PROXY_PORT", "XRAY_TG_SOCKS_PORT"}, 7893),
 		GlobalHTTPPort:   envIntAny([]string{"GLOBAL_HTTP_PROXY_PORT", "XRAY_GLOBAL_HTTP_PORT"}, 7890),
 		GlobalSocksPort:  envIntAny([]string{"GLOBAL_SOCKS_PROXY_PORT", "XRAY_GLOBAL_SOCKS_PORT"}, 7894),
-		TransparentPort:  envInt("XRAY_GLOBAL_TRANSPARENT_PORT", 7895),
-		RedirectPort:     envInt("XRAY_GLOBAL_REDIRECT_PORT", 7896),
-		TransparentIPv6:  envInt("XRAY_GLOBAL_TRANSPARENT_IPV6_PORT", 7897),
-		RedirectIPv6:     envInt("XRAY_GLOBAL_REDIRECT_IPV6_PORT", 7898),
-		TProxyMark:       envInt("XRAY_TPROXY_MARK", 1),
-		OutboundMark:     envInt("XRAY_OUTBOUND_MARK", 255),
 		InstallBin:       envString("XRAY_PROXY_SWITCH_BIN", "/usr/local/bin/xray-proxy"),
 		SystemdService:   envString("XRAY_SYSTEMD_SERVICE_NAME", "xray-proxy-manager.service"),
 		RestoreService:   envString("XRAY_PROXY_BOOT_RESTORE_SERVICE_NAME", "xray-proxy-state.service"),
 		XrayServiceUser:  envString("XRAY_PROXY_SERVICE_USER", "xray-proxy"),
 		TGTargetServices: splitFields(envString("TG_PROXY_SERVICES", "openclaw hermes hermes-gateway user:root:hermes-gateway")),
 		DevTargetUser:    envString("DEV_PROXY_TARGET_USER", ""),
+		TestURL:          envString("XRAY_PROXY_TEST_URL", "https://www.google.com/generate_204"),
 	}
 }
 
@@ -85,15 +92,11 @@ func (c Config) Validate() error {
 		return err
 	}
 	ports := map[string]int{
-		"XRAY_DEV_HTTP_PORT":                c.DevHTTPPort,
-		"XRAY_TG_HTTP_PORT":                 c.TGHTTPPort,
-		"XRAY_TG_SOCKS_PORT":                c.TGSocksPort,
-		"XRAY_GLOBAL_HTTP_PORT":             c.GlobalHTTPPort,
-		"XRAY_GLOBAL_SOCKS_PORT":            c.GlobalSocksPort,
-		"XRAY_GLOBAL_TRANSPARENT_PORT":      c.TransparentPort,
-		"XRAY_GLOBAL_REDIRECT_PORT":         c.RedirectPort,
-		"XRAY_GLOBAL_TRANSPARENT_IPV6_PORT": c.TransparentIPv6,
-		"XRAY_GLOBAL_REDIRECT_IPV6_PORT":    c.RedirectIPv6,
+		"XRAY_DEV_HTTP_PORT":     c.DevHTTPPort,
+		"XRAY_TG_HTTP_PORT":      c.TGHTTPPort,
+		"XRAY_TG_SOCKS_PORT":     c.TGSocksPort,
+		"XRAY_GLOBAL_HTTP_PORT":  c.GlobalHTTPPort,
+		"XRAY_GLOBAL_SOCKS_PORT": c.GlobalSocksPort,
 	}
 	seen := map[int]string{}
 	for name, port := range ports {
@@ -105,8 +108,8 @@ func (c Config) Validate() error {
 		}
 		seen[port] = name
 	}
-	if c.TProxyMark <= 0 || c.OutboundMark <= 0 {
-		return fmt.Errorf("mark 配置必须为正整数")
+	if err := validateTestURL(c.TestURL); err != nil {
+		return err
 	}
 	for _, svc := range c.TGTargetServices {
 		if svc == "" {
@@ -122,13 +125,13 @@ func (c Config) Validate() error {
 	return nil
 }
 
-func (c Config) XrayBin() string       { return filepath.Join(c.CoreDir, "xray") }
-func (c Config) XrayConfig() string    { return filepath.Join(c.CoreDir, "config.json") }
-func (c Config) StorePath() string     { return filepath.Join(c.CoreDir, "state.json") }
-func (c Config) StoreLockPath() string { return filepath.Join(c.CoreDir, ".state.lock") }
-func (c Config) LogPath() string       { return filepath.Join(c.CoreDir, "xray.log") }
-func (c Config) MarkerPath() string    { return filepath.Join(c.CoreDir, ".managed-by-xray-proxy-go") }
-func (c Config) DevBackupPath() string { return filepath.Join(c.CoreDir, "dev-proxy-backup.json") }
+func (c Config) XrayBin() string         { return filepath.Join(c.CoreDir, "xray") }
+func (c Config) XrayConfig() string      { return filepath.Join(c.CoreDir, "config.json") }
+func (c Config) StorePath() string       { return filepath.Join(c.CoreDir, "state.json") }
+func (c Config) StoreLockPath() string   { return filepath.Join(c.CoreDir, ".state.lock") }
+func (c Config) StoreBackupPath() string { return filepath.Join(c.CoreDir, "state.json.bak") }
+func (c Config) MarkerPath() string      { return filepath.Join(c.CoreDir, ".managed-by-xray-proxy-go") }
+func (c Config) DevBackupPath() string   { return filepath.Join(c.CoreDir, "dev-proxy-backup.json") }
 func (c Config) TelegramDropInDir(s string) string {
 	return filepath.Join("/etc/systemd/system", normalizeSystemdServiceName(s)+".d")
 }

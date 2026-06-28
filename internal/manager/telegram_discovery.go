@@ -183,8 +183,11 @@ func isTelegramRelatedUnit(path, service string) bool {
 		if !ok {
 			continue
 		}
+		// 只按"该单元自身是否为 Telegram 客户端"来判定，匹配标识性字段。
+		// 不再匹配 After/Before/Wants/Requires/PartOf——这些只表达依赖/排序关系，
+		// 一个仅依赖 hermes 的无关服务不应被注入代理环境并强制重启。
 		switch strings.ToLower(strings.TrimSpace(key)) {
-		case "description", "documentation", "execstart", "environment", "environmentfile", "partof", "wants", "requires", "after", "before":
+		case "description", "documentation", "execstart", "environment", "environmentfile":
 			if containsTelegramServiceKeyword(value) {
 				return true
 			}

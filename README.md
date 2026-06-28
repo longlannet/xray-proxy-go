@@ -2,7 +2,7 @@
 
 `xray-proxy-go` 是一个面向 Linux 服务器的 Xray 代理管理器。项目由一个安装脚本和一个 Go 编写的单二进制管理程序组成：
 
-- `install.sh`：负责安装期工作，包括准备 Go 环境、安装 Xray、编译本仓库源码并安装 `xray-proxy`。
+- `install.sh`：负责安装期工作——安装 Xray、安装 `xray-proxy` 管理程序、初始化 systemd。支持离线整合包安装（推荐，解压即装、不联网、不需要 Go）、联机下载预编译二进制（失败回退源码编译）、源码编译三种方式。
 - `xray-proxy`：负责运行期管理，包括节点管理、场景开关、Xray 配置生成、systemd 服务管理和开机恢复。
 
 > 当前项目适合在使用 systemd 的 Linux 服务器上运行。大多数管理命令需要 root 权限，建议统一使用 `sudo` 执行。
@@ -10,7 +10,9 @@
 ## 功能特性
 
 - 单二进制 Go 管理程序，安装后命令为 `xray-proxy`。
-- 安装脚本从本仓库源码编译管理程序。
+- 安装脚本默认下载预编译二进制（带 SHA256 校验，装有 minisign 时默认验证签名），目标机无需安装 Go；下载失败时自动回退到本仓库源码编译。
+- 支持离线安装：屏蔽 GitHub / 气隙环境下，下载自包含整合包（含 `install.sh` + 管理程序 + Xray + geo），解压后运行包内 `install.sh` 即可，全程不联网、不需要 Go。
+- 通过 GitHub Actions 在打 tag 时自动交叉编译多架构（amd64/arm64/386/armv7）、用 minisign 签名并发布 Release。
 - 支持 Xray 主服务和开机恢复服务的 systemd 管理。
 - 支持三类代理场景：
   - 全局代理：写入系统 profile 和 apt 代理配置。
@@ -26,8 +28,13 @@
 
 ```text
 xray-proxy-go/
+├── .github/
+│   └── workflows/
+│       ├── ci.yml          # 格式/测试/vet/shellcheck
+│       └── release.yml     # 打 tag 交叉编译多架构 + 校验和/签名 + 发布 Release
 ├── .gitignore
 ├── LICENSE
+├── NOTICE              # 离线整合包再分发 Xray(MPL-2.0) 的署名声明
 ├── SECURITY.md
 ├── go.mod
 ├── install.sh
@@ -55,31 +62,90 @@ xray-proxy-go/
 - systemd。
 - root 或 sudo 权限。
 - 可用的软件包管理器之一：apt、dnf、yum、apk、zypper。
-- 可访问网络，用于安装依赖和 Xray。
-- Go 1.22 或更高版本。若系统没有可用 Go，安装脚本会自动准备。
+- 可访问网络，用于安装依赖、Xray 和管理程序。
+- Go 1.22 或更高版本**仅在源码编译时需要**（默认走预编译二进制，目标机无需 Go）。若需源码编译且系统没有可用 Go，安装脚本会自动准备。
 
 ## 快速开始
 
-### 1. 进入源码目录
+**推荐用方式一（离线整合包）安装**：下载一个自包含 `tar.gz`，解压后运行包内的 `install.sh` 即可，**全程不联网、不需要 Go**，最适合屏蔽 GitHub 的网络环境。能直连 GitHub 的机器也可以用方式二一行联机安装。
+
+### 方式一：下载整合包，解压即装（推荐 / 默认）
+
+用 Release 里的**自包含整合包**安装——**解压后直接运行包内的 `install.sh`**，全程不联网、不需要 Go。整合包是一个带顶层目录的 `tar.gz`，内含 `install.sh` + 管理程序 + Xray + `geoip.dat`/`geosite.dat` + `NOTICE`。
+
+1. 在任意能上网的机器上，从 Release 下载对应架构的 `xray-proxy_bundle_linux_<arch>.tar.gz`（想验签的话连同 `.minisig` 一起下）。
+2. 用任意带外渠道（scp、网盘、U 盘等）把它拷到目标机。
+3. 解压并运行包内脚本：
 
 ```bash
-cd /opt/xray-proxy/xray-proxy-go
+tar xzf xray-proxy_bundle_linux_amd64.tar.gz
+cd xray-proxy_bundle_linux_amd64
+sudo ./install.sh                 # 解压即装
+sudo ./install.sh 'vless://...'   # 同时导入节点
 ```
 
-如果你的仓库在其他位置，请进入实际的 `xray-proxy-go` 目录。
+`install.sh` 检测到同目录的 `xray-proxy`/`xray` 二进制，就走离线本地安装。
 
-### 2. 安装
+#### 想要密码学保证？解压前先验签
 
-不导入节点，只安装环境、编译程序并初始化 systemd：
+自包含整合包**无法验证它自身**（脚本和二进制都在包内），所以"解压即装"本质是信任这个 tar 的来源。如果你要确定性的完整性保证，请在**解压前**用随包的 `.minisig` + 公钥（见下文「发布签名公钥」）验证整个 tar：
 
 ```bash
-sudo bash ./install.sh
+minisign -Vm xray-proxy_bundle_linux_amd64.tar.gz \
+  -x xray-proxy_bundle_linux_amd64.tar.gz.minisig \
+  -P RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb
+# 验签通过后再 tar xzf 解压、运行 install.sh
+```
+
+### 方式二：一行联机安装（能直连 GitHub 时）
+
+> 前提：仓库已发布对应架构的 Release。一行命令通过管道运行时拿不到源码，**无法回退到源码编译**，发布 Release 之前请用方式三从源码安装。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/longlannet/xray-proxy-go/main/install.sh | sudo bash
 ```
 
 安装时导入一个节点链接：
 
 ```bash
-sudo bash ./install.sh 'vless://...'
+curl -fsSL https://raw.githubusercontent.com/longlannet/xray-proxy-go/main/install.sh | sudo bash -s -- 'vless://...'
+```
+
+脚本内置了发布公钥：**只要目标机装了 `minisign`，默认就会验证 `checksums.txt.minisig` 签名**（best-effort），并始终校验二进制 SHA256。想把签名校验设为**强制**（缺 minisign 或验签失败即中止），显式传入公钥并可固定版本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/longlannet/xray-proxy-go/main/install.sh \
+  | sudo XRAY_PROXY_VERSION=v0.3.0 \
+         XRAY_PROXY_MINISIGN_PUBKEY=RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb \
+         bash
+```
+
+> 安全提示：`curl | sudo bash` 适合全新自管 VPS。生产环境建议先下载审阅脚本，或固定 `XRAY_PROXY_VERSION=vX.Y.Z`；使用镜像 `XRAY_PROXY_BASE_URL` 时只用你信任的 HTTPS 源。
+
+#### 发布签名公钥
+
+本项目 Release 的 `checksums.txt` 与各离线整合包均由以下 minisign 公钥签名：
+
+```text
+RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb
+```
+
+也可手动校验已下载的产物：
+
+```bash
+minisign -Vm checksums.txt -x checksums.txt.minisig \
+  -P RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb
+sha256sum -c checksums.txt
+```
+
+### 方式三：从源码安装
+
+进入仓库目录后执行（缺 Go 会自动准备；如想强制源码编译，设 `XRAY_PROXY_BUILD_FROM_SOURCE=1`）：
+
+```bash
+sudo bash ./install.sh
+sudo bash ./install.sh 'vless://...'        # 同时导入节点
+sudo XRAY_PROXY_BUILD_FROM_SOURCE=1 bash ./install.sh
 ```
 
 安装完成后，管理程序会安装为：
@@ -94,7 +160,7 @@ sudo bash ./install.sh 'vless://...'
 sudo xray-proxy
 ```
 
-### 3. 导入订阅或添加节点
+### 安装后：导入订阅或添加节点
 
 导入订阅链接：
 
@@ -114,7 +180,7 @@ sudo xray-proxy node add 'vless://...' '我的节点'
 sudo xray-proxy node list
 ```
 
-### 4. 开启代理场景
+### 安装后：开启代理场景
 
 开启全局代理：
 
@@ -142,22 +208,20 @@ sudo xray-proxy status
 
 ## 安装脚本说明
 
-安装脚本需要在 `xray-proxy-go` 源码目录运行：
-
-```bash
-cd /opt/xray-proxy/xray-proxy-go
-sudo bash ./install.sh [节点链接]
-```
+`install.sh` 支持三种用法（见上文「快速开始」）：离线整合包安装（默认推荐）、联机一行安装（下载预编译二进制）、源码目录安装。下面以联机安装为例说明各步骤；离线安装会跳过其中的下载与编译。
 
 脚本会执行以下步骤：
 
 1. 检查 root 权限。
 2. 安装基础依赖：curl、ca-certificates、tar、unzip。
-3. 检查 Go 版本，必要时安装 Go。
-4. 安装 Xray 到核心目录。
-5. 从本仓库源码编译 `cmd/xray-proxy`。
-6. 安装管理程序到 `/usr/local/bin/xray-proxy`。
-7. 调用 `xray-proxy install` 初始化状态目录和 systemd 服务。
+3. 安装 Xray 到核心目录。
+4. 安装管理程序 `xray-proxy` 到 `/usr/local/bin/`：
+   - 默认下载对应架构的预编译二进制（`xray-proxy_linux_<arch>.tar.gz`），用 `checksums.txt` 校验 SHA256；脚本内置发布公钥，装了 `minisign` 就默认验证签名（显式设 `XRAY_PROXY_MINISIGN_PUBKEY` 则强制验签）。目标机无需 Go。
+   - 下载失败，或设置 `XRAY_PROXY_BUILD_FROM_SOURCE=1` 时，检查/准备 Go 并从本仓库源码编译 `cmd/xray-proxy`（仅在源码目录可行）。
+5. 调用 `xray-proxy install` 初始化状态目录和 systemd 服务。
+
+> 离线安装（见上文「方式一」）：在解压后的整合包目录里运行包内的 `install.sh`，脚本检测到同目录的二进制即跳过第 2-4 步的下载与编译，直接安装包内的管理程序与 Xray，再做第 5 步初始化。
+> 运行 `xray-proxy version` 可查看已安装的版本与 commit（预编译二进制会在构建时注入 git tag 与 commit）。
 
 ### 安装脚本是否交互式
 
@@ -293,6 +357,12 @@ sudo xray-proxy node rename '节点ID' '新备注'
 sudo xray-proxy test
 ```
 
+### 查看版本
+
+```bash
+xray-proxy version
+```
+
 ## 三种代理场景
 
 ### 全局代理
@@ -419,7 +489,13 @@ sudo TG_PROXY_SERVICES='openclaw hermes user:root:hermes-gateway' xray-proxy tg 
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `GO_VERSION` | `1.22.12` | 安装脚本准备的 Go 版本。 |
+| `XRAY_PROXY_VERSION` | `latest` | 要下载的预编译管理程序版本，例如 `v0.3.0`。 |
+| `XRAY_PROXY_REPO` | `longlannet/xray-proxy-go` | 预编译二进制所在的 GitHub 仓库 `owner/name`。 |
+| `XRAY_PROXY_BASE_URL` | 空 | 自定义预编译下载基址（必须 `https`），优先级高于 `XRAY_PROXY_VERSION`/仓库默认地址。 |
+| `XRAY_PROXY_MINISIGN_PUBKEY` | 空 | 提供时用 minisign 额外校验 `checksums.txt` 的签名（`checksums.txt.minisig`）。 |
+| `XRAY_PROXY_BUILD_FROM_SOURCE` | `0` | 设为 `1` 时跳过预编译下载，强制本地源码编译（需要 Go）。 |
+| `--offline`（命令行选项） | — | 强制走离线本地安装，要求在解压后的整合包目录内运行（同目录有 `xray-proxy`/`xray`）；通常无需显式指定，脚本会自动检测。 |
+| `GO_VERSION` | `1.22.12` | 源码编译时准备的 Go 版本（仅回退编译时用到）。 |
 | `GO_TARBALL_SHA256` | 空 | Go 安装包 SHA256。留空时安装脚本会从 go.dev 官方 `.sha256` 文件获取并校验。 |
 | `GO_INSTALL_DIR` | `/usr/local` | Go 安装父目录。 |
 | `SKIP_GO_INSTALL` | `0` | 设为 `1` 时不安装 Go，要求系统已有 `go` 命令。 |
@@ -430,7 +506,7 @@ sudo TG_PROXY_SERVICES='openclaw hermes user:root:hermes-gateway' xray-proxy tg 
 | `XRAY_GITHUB_RELEASE_BASE` | `https://github.com/XTLS/Xray-core/releases/latest/download` | 官方 Xray 发布下载基础地址。 |
 | `XRAY_XXV_ZIP_URL` | `https://xxv.cc/7c9fxLN4nm4BFU8fjD.zip` | `xxv.cc` Xray zip 镜像地址。 |
 | `XRAY_ZIP_URL` | 空 | 自定义 Xray zip 下载地址；非空时优先级高于 `XRAY_DOWNLOAD_SOURCE`。使用自定义地址时建议同时设置 `XRAY_ZIP_SHA256`。 |
-| `XRAY_ZIP_SHA256` | 空 | Xray zip 的 SHA256；非空时安装脚本会校验。使用 `xxv` 或自定义下载源时建议设置。 |
+| `XRAY_ZIP_SHA256` | 空 | Xray zip 的 SHA256；非空时安装脚本会校验。使用官方源时留空，安装脚本会自动拉取官方 `.dgst` 校验文件并校验；使用 `xxv` 或自定义下载源时建议显式设置。 |
 | `SKIP_XRAY_INSTALL` | `0` | 设为 `1` 时跳过 Xray 安装，要求核心目录已有可执行 `xray`。 |
 | `SKIP_MANAGER_INIT` | `0` | 设为 `1` 时只安装依赖和程序，不调用管理器初始化。 |
 
@@ -444,7 +520,7 @@ sudo XRAY_DOWNLOAD_SOURCE=official bash ./install.sh
 sudo XRAY_DOWNLOAD_SOURCE=xxv bash ./install.sh
 ```
 
-安装脚本会校验 Go 安装包 SHA256，并会拒绝把核心目录设置为 `/etc`、`/usr`、`/home`、`/root`、`/tmp` 等敏感系统路径。对于已经存在的核心目录，安装脚本不会再无条件修改目录权限；只有新建核心目录时才设置为 `0700`。Xray 默认从官方 GitHub Release 下载；如果需要使用 `xxv.cc` 镜像，可以设置 `XRAY_DOWNLOAD_SOURCE=xxv`。如果使用 `xxv` 或自定义 `XRAY_ZIP_URL` 下载源，建议同时设置 `XRAY_ZIP_SHA256`，避免下载内容被篡改。
+安装脚本会校验 Go 安装包 SHA256，并会拒绝把核心目录设置为 `/etc`、`/usr`、`/home`、`/root`、`/tmp` 等敏感系统路径。对于已经存在的核心目录，安装脚本不会再无条件修改目录权限；只有新建核心目录时才设置为 `0700`。Xray 默认从官方 GitHub Release 下载，并会自动拉取同目录的官方 `.dgst` 校验文件校验 SHA256；如果需要使用 `xxv.cc` 镜像，可以设置 `XRAY_DOWNLOAD_SOURCE=xxv`。使用 `xxv` 或自定义 `XRAY_ZIP_URL` 下载源时，官方 `.dgst` 不可用，建议显式设置 `XRAY_ZIP_SHA256`，避免下载内容被篡改。
 
 ### 运行期变量
 
@@ -464,6 +540,9 @@ sudo XRAY_DOWNLOAD_SOURCE=xxv bash ./install.sh
 | `DEV_PROXY_TARGET_USER` | 空 | 开发代理要修改 git/npm 配置的目标用户。 |
 | `TG_PROXY_SERVICES` | `openclaw hermes hermes-gateway user:root:hermes-gateway` | Telegram 代理要注入环境变量的手动 systemd 服务列表；程序还会自动发现 OpenClaw/Hermes 系统级和用户级服务，用户级服务使用 `user:用户名:服务名`。 |
 | `XRAY_PROXY_ALLOW_HTTP_SUBSCRIPTION` | `0` | 默认拒绝明文 HTTP 订阅；确需导入 HTTP 订阅时设为 `1`，程序会打印风险警告。 |
+| `XRAY_PROXY_ALLOW_PRIVATE_SUBSCRIPTION` | `0` | 默认拒绝订阅链接解析到环回/私网/链路本地/CGNAT 等非公网地址（含重定向跳转），以防 SSRF；订阅托管在内网时设为 `1`。 |
+| `XRAY_PROXY_ALLOW_PUBLIC_BIND` | `0` | 代理监听地址默认只允许环回。本地 HTTP/SOCKS 入站无认证，绑定 `0.0.0.0` 或公网 IP 会形成开放代理；确需对外监听时设为 `1`。 |
+| `XRAY_PROXY_TEST_URL` | `https://www.google.com/generate_204` | `xray-proxy test` 通过全局代理测试连通性时请求的地址；必须是 http(s) URL，可改为在你的网络环境下更可达的目标。 |
 
 示例：
 

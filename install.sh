@@ -9,6 +9,8 @@ DEFAULT_XRAY_DOWNLOAD_SOURCE="official"
 DEFAULT_XRAY_ZIP_URL=""
 DEFAULT_XRAY_XXV_ZIP_URL="https://xxv.cc/7c9fxLN4nm4BFU8fjD.zip"
 DEFAULT_XRAY_GITHUB_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/latest/download"
+# 本项目 Release 的 minisign 公钥；离线安装默认用它验签离线整合包。
+DEFAULT_MANAGER_MINISIGN_PUBKEY="RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb"
 
 GO_VERSION="${GO_VERSION:-$DEFAULT_GO_VERSION}"
 GO_TARBALL_SHA256="${GO_TARBALL_SHA256:-}"
@@ -25,6 +27,16 @@ SKIP_GO_INSTALL="${SKIP_GO_INSTALL:-0}"
 SKIP_XRAY_INSTALL="${SKIP_XRAY_INSTALL:-0}"
 SKIP_MANAGER_INIT="${SKIP_MANAGER_INIT:-0}"
 FORCE_GO_INSTALL="${FORCE_GO_INSTALL:-0}"
+DEFAULT_REPO="longlannet/xray-proxy-go"
+MANAGER_REPO="${XRAY_PROXY_REPO:-$DEFAULT_REPO}"
+MANAGER_VERSION="${XRAY_PROXY_VERSION:-latest}"
+MANAGER_BASE_URL="${XRAY_PROXY_BASE_URL:-}"
+# 默认用内置发布公钥；显式设置 XRAY_PROXY_MINISIGN_PUBKEY 时则强制要求验签成功。
+MANAGER_MINISIGN_PUBKEY="${XRAY_PROXY_MINISIGN_PUBKEY:-$DEFAULT_MANAGER_MINISIGN_PUBKEY}"
+MANAGER_MINISIGN_REQUIRED=0
+[[ -n "${XRAY_PROXY_MINISIGN_PUBKEY:-}" ]] && MANAGER_MINISIGN_REQUIRED=1
+BUILD_FROM_SOURCE="${XRAY_PROXY_BUILD_FROM_SOURCE:-0}"
+FORCE_OFFLINE_LOCAL=0
 NODE_URL=""
 
 log() { printf '[%s] %s\n' "$SCRIPT_NAME" "$*"; }
@@ -42,8 +54,24 @@ usage() {
 用法：
   sudo bash ./install.sh [节点链接]
 
+离线安装（适合屏蔽 GitHub 的网络环境，全程不联网、不需要 Go）：
+  从 Release 下载自包含整合包，解压后在其目录内运行本脚本即可：
+    tar xzf xray-proxy_bundle_linux_<arch>.tar.gz
+    cd xray-proxy_bundle_linux_<arch>
+    sudo ./install.sh [节点链接]
+  脚本检测到同目录的 xray-proxy/xray 二进制即走离线本地安装（也可显式加 --offline）。
+  自包含包无法验证它自身；如需校验，请在解压前用随包的 .minisig + 公钥验证整个 tar：
+    minisign -Vm <包>.tar.gz -x <包>.tar.gz.minisig -P <公钥>
+
+管理程序获取方式（默认优先下载预编译二进制，目标机无需 Go；失败时回退源码编译）：
+  XRAY_PROXY_VERSION=latest                    要下载的预编译版本，如 v0.3.0
+  XRAY_PROXY_REPO=longlannet/xray-proxy-go     预编译二进制所在的 GitHub 仓库 owner/name
+  XRAY_PROXY_BASE_URL=https://mirror/dl         自定义预编译下载基址（必须 https），优先级最高
+  XRAY_PROXY_MINISIGN_PUBKEY=RWxxxx             用 minisign 校验签名（联机校验 checksums.txt，离线校验整合包）
+  XRAY_PROXY_BUILD_FROM_SOURCE=1                跳过预编译下载，强制本地源码编译
+
 常用环境变量：
-  GO_VERSION=1.22.12                         缺少 Go 或版本过低时准备的 Go 版本
+  GO_VERSION=1.22.12                         缺少 Go 或版本过低时准备的 Go 版本（仅源码编译用到）
   GO_TARBALL_SHA256=...                      Go 安装包 SHA256；留空时从 go.dev 官方 .sha256 文件获取并校验
   GO_INSTALL_DIR=/usr/local                   Go 安装父目录
   SKIP_GO_INSTALL=1                           不安装 Go，要求系统已有 go 命令
@@ -60,14 +88,25 @@ usage() {
 EOF
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  usage
-  exit 0
-fi
-if [[ $# -gt 1 ]]; then
-  fatal "只接受一个可选节点链接参数"
-fi
-NODE_URL="${1:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --offline)
+      FORCE_OFFLINE_LOCAL=1
+      ;;
+    --*)
+      fatal "未知选项：$1"
+      ;;
+    *)
+      [[ -z "$NODE_URL" ]] || fatal "只接受一个可选节点链接参数"
+      NODE_URL="$1"
+      ;;
+  esac
+  shift
+done
 
 require_root() {
   if [[ "$(id -u)" != "0" ]]; then
@@ -264,6 +303,35 @@ xray_download_url() {
   esac
 }
 
+# xray_expected_sha256 解析期望的 Xray zip SHA256：
+#   1) 显式设置的 XRAY_ZIP_SHA256 优先；
+#   2) 否则在使用官方源（未自定义 XRAY_ZIP_URL）时，尝试拉取官方 .dgst 校验文件并提取 SHA256；
+#   3) 其余情况返回空（由调用方决定是否仅警告）。
+xray_expected_sha256() {
+  local url="$1"
+  if [[ -n "$XRAY_ZIP_SHA256" ]]; then
+    printf '%s\n' "$XRAY_ZIP_SHA256"
+    return 0
+  fi
+  if [[ -n "$XRAY_ZIP_URL" ]]; then
+    return 0
+  fi
+  case "${XRAY_DOWNLOAD_SOURCE,,}" in
+    official|github|xtls)
+      local dgst_text checksum
+      if dgst_text="$(curl -fL --connect-timeout 15 --retry 3 --retry-delay 2 "${url}.dgst" 2>/dev/null)"; then
+        # XTLS 官方 .dgst 把 SHA-256 标注为 `SHA2-256= <hex>`（不是 `SHA256=`）。
+        # 用 sha2-?256 精确匹配 SHA2-256 行（不会误中 SHA2-512 / SHA3-256），再取 64 位十六进制。
+        checksum="$(printf '%s\n' "$dgst_text" | grep -iE 'sha2-?256' | grep -oiE '[0-9a-f]{64}' | head -n1)"
+        if is_sha256_hex "$checksum"; then
+          printf '%s\n' "$checksum"
+        fi
+      fi
+      ;;
+  esac
+  return 0
+}
+
 validate_core_dir() {
   if [[ -z "$CORE_DIR" || "$CORE_DIR" != /* ]]; then
     fatal "XRAY_PROXY_MANAGER_DIR 必须是绝对路径：$CORE_DIR"
@@ -336,8 +404,13 @@ install_xray() {
   log "下载 Xray：$url"
   run_quiet "下载 Xray" curl -fL --connect-timeout 15 --retry 3 --retry-delay 2 -o "$zip" "$url"
 
-  if [[ -n "$XRAY_ZIP_SHA256" ]]; then
-    verify_sha256_file "Xray" "$zip" "$XRAY_ZIP_SHA256"
+  local expected
+  expected="$(xray_expected_sha256 "$url")"
+  if [[ -n "$expected" ]]; then
+    verify_sha256_file "Xray" "$zip" "$expected"
+    log "Xray SHA256 校验通过"
+  else
+    log "警告：未校验 Xray 完整性（未提供 XRAY_ZIP_SHA256，且无法自动获取官方校验和）；建议设置 XRAY_ZIP_SHA256"
   fi
 
   run_quiet "解压 Xray" unzip -oq "$zip" -d "$tmp/xray"
@@ -356,6 +429,104 @@ install_xray() {
   trap - EXIT
 }
 
+arch_release() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'amd64\n' ;;
+    aarch64|arm64) printf 'arm64\n' ;;
+    i386|i686) printf '386\n' ;;
+    armv7l|armhf) printf 'armv7\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_release_inputs() {
+  case "$MANAGER_REPO" in
+    ""|/*|*/*/*|*" "*|*..*) fatal "XRAY_PROXY_REPO 格式无效，应为 owner/name：$MANAGER_REPO" ;;
+  esac
+  case "$MANAGER_VERSION" in
+    ""|*/*|*" "*|*"?"*|*"#"*) fatal "XRAY_PROXY_VERSION 无效：$MANAGER_VERSION" ;;
+  esac
+  if [[ -n "$MANAGER_BASE_URL" ]]; then
+    case "$MANAGER_BASE_URL" in
+      https://*) ;;
+      *) fatal "XRAY_PROXY_BASE_URL 必须是 https 地址：$MANAGER_BASE_URL" ;;
+    esac
+    case "$MANAGER_BASE_URL" in
+      *"?"*|*"#"*) fatal "XRAY_PROXY_BASE_URL 不能包含 ? 或 #" ;;
+    esac
+  fi
+}
+
+release_base_url() {
+  if [[ -n "$MANAGER_BASE_URL" ]]; then
+    printf '%s\n' "${MANAGER_BASE_URL%/}"
+  elif [[ "$MANAGER_VERSION" == "latest" ]]; then
+    printf 'https://github.com/%s/releases/latest/download\n' "$MANAGER_REPO"
+  else
+    printf 'https://github.com/%s/releases/download/%s\n' "$MANAGER_REPO" "$MANAGER_VERSION"
+  fi
+}
+
+# fetch_https 仅允许 https（含重定向），并限制下载体积。
+fetch_https() {
+  local url="$1" out="$2" maxsize="$3"
+  curl -fL --proto '=https' --proto-redir '=https' \
+    --connect-timeout 15 --retry 3 --retry-delay 2 \
+    --max-filesize "$maxsize" -o "$out" "$url"
+}
+
+# install_manager_prebuilt 下载并安装预编译二进制；成功返回 0，否则返回 1 由调用方回退源码编译。
+install_manager_prebuilt() {
+  local arch base asset tmp expected
+  arch="$(arch_release)" || { log "当前架构 $(uname -m) 无预编译二进制"; return 1; }
+  validate_release_inputs
+  base="$(release_base_url)"
+  asset="xray-proxy_linux_${arch}.tar.gz"
+  tmp="$(mktemp -d)"
+
+  log "下载预编译管理程序：$base/$asset"
+  if ! fetch_https "$base/$asset" "$tmp/$asset" 104857600; then
+    log "预编译二进制下载失败"
+    rm -rf "$tmp"
+    return 1
+  fi
+  if ! fetch_https "$base/checksums.txt" "$tmp/checksums.txt" 1048576; then
+    log "校验和文件下载失败"
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  if [[ -n "$MANAGER_MINISIGN_PUBKEY" ]] && need_cmd minisign; then
+    if fetch_https "$base/checksums.txt.minisig" "$tmp/checksums.txt.minisig" 1048576; then
+      run_quiet "校验 checksums 签名" minisign -Vm "$tmp/checksums.txt" -x "$tmp/checksums.txt.minisig" -P "$MANAGER_MINISIGN_PUBKEY"
+      log "minisign 签名校验通过"
+    elif [[ "$MANAGER_MINISIGN_REQUIRED" == "1" ]]; then
+      rm -rf "$tmp"
+      fatal "签名文件下载失败，无法按要求校验签名"
+    else
+      log "未获取到签名文件，跳过签名校验（仍会校验 SHA256）"
+    fi
+  elif [[ "$MANAGER_MINISIGN_REQUIRED" == "1" ]]; then
+    rm -rf "$tmp"
+    fatal "设置了 XRAY_PROXY_MINISIGN_PUBKEY 但未找到 minisign"
+  fi
+
+  # checksums.txt 每行形如 "<64hex>  <asset>"（二进制模式为 "<hex> *<asset>"）。
+  expected="$(awk -v a="$asset" '{name=$2; sub(/^\*/,"",name); if (name==a) {print $1; exit}}' "$tmp/checksums.txt")"
+  if [[ -z "$expected" ]]; then
+    fatal "checksums.txt 中找不到 $asset 的校验和"
+  fi
+  verify_sha256_file "管理程序" "$tmp/$asset" "$expected"
+  log "管理程序 SHA256 校验通过"
+
+  run_quiet "解压管理程序" tar -xzf "$tmp/$asset" -C "$tmp" xray-proxy
+  [[ -f "$tmp/xray-proxy" ]] || fatal "压缩包中未找到 xray-proxy"
+  run_quiet "安装管理程序" install -D -m 755 "$tmp/xray-proxy" "$INSTALL_BIN"
+  log "预编译管理程序已安装：$INSTALL_BIN（版本 $("$INSTALL_BIN" version 2>/dev/null || echo 未知)）"
+  rm -rf "$tmp"
+  return 0
+}
+
 build_manager() {
   local dir out
   dir="$(repo_dir)"
@@ -365,10 +536,68 @@ build_manager() {
 
   log "编译本地 Go 管理程序"
   run_quiet "编译 Go 管理程序" env CGO_ENABLED=0 go build -C "$dir" -trimpath -ldflags "-s -w" -o "$out" ./cmd/xray-proxy
-  run_quiet "安装 Go 管理程序" install -m 755 "$out" "$INSTALL_BIN"
+  run_quiet "安装 Go 管理程序" install -D -m 755 "$out" "$INSTALL_BIN"
   rm -f "$out"
   trap - EXIT
   log "Go 管理程序已安装：$INSTALL_BIN"
+}
+
+# install_manager 默认优先下载预编译二进制（目标机无需 Go），失败时回退本地源码编译。
+install_manager() {
+  if [[ "$BUILD_FROM_SOURCE" == "1" ]]; then
+    log "按 XRAY_PROXY_BUILD_FROM_SOURCE=1 从源码编译管理程序"
+    ensure_go
+    build_manager
+    return 0
+  fi
+  if install_manager_prebuilt; then
+    return 0
+  fi
+  # 预编译失败时才回退源码编译，但这只有在源码目录（有 go.mod）里才可能。
+  # 通过 `curl | sudo bash` 在任意目录运行时拿不到仓库，给出清晰指引而不是含糊的 go.mod 报错。
+  if [[ ! -f "$(repo_dir)/go.mod" ]]; then
+    fatal "预编译二进制下载失败，且当前不在源码目录（找不到 go.mod），无法回退编译。请：① 确认仓库已发布对应架构的 Release（检查 XRAY_PROXY_VERSION/XRAY_PROXY_REPO）；或 ② 克隆仓库后在源码目录运行 ./install.sh；或 ③ 用 --offline 离线整合包安装。"
+  fi
+  log "改用本地源码编译管理程序"
+  ensure_go
+  build_manager
+}
+
+# bundle_dir 返回 install.sh 物理所在目录；通过管道（curl|bash）运行时 BASH_SOURCE 为空，返回空。
+bundle_dir() {
+  local src="${BASH_SOURCE[0]:-}"
+  [[ -n "$src" && -f "$src" ]] || return 0
+  (cd "$(dirname "$src")" && pwd -P)
+}
+
+# is_self_contained_bundle 判断 install.sh 同目录是否为自包含整合包（解压后形态：
+# install.sh 与 xray-proxy / xray 二进制同处一目录）。
+is_self_contained_bundle() {
+  local bdir="$1"
+  [[ -n "$bdir" && -f "$bdir/xray-proxy" && -f "$bdir/xray" && ! -f "$bdir/go.mod" ]]
+}
+
+# install_offline_local 从 install.sh 同目录的整合包文件离线安装（不联网、不需要 Go）。
+# 自包含整合包里 install.sh 与二进制同处一目录，解压后直接运行本脚本即走这里。
+# 注意：自包含包无法验证它自身（脚本与二进制都在包内）；如需密码学保证，请在解压前用随包的
+# .minisig + 公钥验证整个 tar。安装前对每个文件强制"常规文件且非符号链接"检查。
+install_offline_local() {
+  local bdir="$1" f
+  require_root
+  for f in xray-proxy xray; do
+    [[ -f "$bdir/$f" && ! -L "$bdir/$f" ]] || fatal "整合包缺少 $f 或不是常规文件：$bdir/$f"
+  done
+  log "离线本地安装（来自 $bdir，不联网、不需要 Go）"
+  log "提示：未对整合包做验签；如需校验，请在解压前执行：minisign -Vm <包>.tar.gz -x <包>.tar.gz.minisig -P <公钥>"
+  ensure_core_dir
+  run_quiet "安装管理程序" install -D -m 755 "$bdir/xray-proxy" "$INSTALL_BIN"
+  run_quiet "安装 Xray" install -m 700 "$bdir/xray" "$CORE_DIR/xray"
+  for f in geoip.dat geosite.dat; do
+    if [[ -f "$bdir/$f" && ! -L "$bdir/$f" ]]; then
+      install -m 600 "$bdir/$f" "$CORE_DIR/$f"
+    fi
+  done
+  log "离线安装完成：$INSTALL_BIN（版本 $("$INSTALL_BIN" version 2>/dev/null || echo 未知)）、$CORE_DIR/xray"
 }
 
 init_manager() {
@@ -386,12 +615,35 @@ init_manager() {
   fi
 }
 
+validate_install_bin() {
+  [[ -n "$INSTALL_BIN" ]] || fatal "XRAY_PROXY_SWITCH_BIN 不能为空"
+  [[ "$INSTALL_BIN" == /* ]] || fatal "XRAY_PROXY_SWITCH_BIN 必须是绝对路径：$INSTALL_BIN"
+  if [[ "$INSTALL_BIN" == *[$' \t\r\n']* ]]; then
+    fatal "XRAY_PROXY_SWITCH_BIN 不能包含空白字符：$INSTALL_BIN"
+  fi
+  if [[ -L "$INSTALL_BIN" ]]; then
+    fatal "XRAY_PROXY_SWITCH_BIN 不能是符号链接：$INSTALL_BIN"
+  fi
+}
+
 main() {
+  validate_install_bin
+  local bdir
+  bdir="$(bundle_dir)"
+  # 自包含整合包：install.sh 与二进制同处一目录（解压后形态），或显式 --offline。
+  if [[ "$FORCE_OFFLINE_LOCAL" == "1" ]] || is_self_contained_bundle "$bdir"; then
+    if ! is_self_contained_bundle "$bdir"; then
+      fatal "--offline 需要在解压后的整合包目录内运行（同目录应有 xray-proxy 与 xray 二进制）"
+    fi
+    install_offline_local "$bdir"
+    init_manager
+    log "离线安装完成。运行：sudo $INSTALL_BIN"
+    return 0
+  fi
   require_root
   install_packages
-  ensure_go
   install_xray
-  build_manager
+  install_manager
   init_manager
   log "安装完成。运行：sudo $INSTALL_BIN"
 }

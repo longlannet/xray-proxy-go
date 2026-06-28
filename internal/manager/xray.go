@@ -14,7 +14,8 @@ func (a *App) ensureCoreDirs() error {
 	if err := ensureDir(a.cfg.CoreDir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(a.cfg.MarkerPath(), []byte("由 xray-proxy-go 管理\n"), 0o600)
+	// 与其余写入保持一致：用原子、O_NOFOLLOW 的写法，避免跟随符号链接。
+	return writeFileAtomic(a.cfg.MarkerPath(), []byte("由 xray-proxy-go 管理\n"), 0o600)
 }
 
 func (a *App) ensureXrayInstalled() error {
@@ -34,7 +35,22 @@ func (a *App) ensureXrayInstalled() error {
 	return nil
 }
 
-func (a *App) writeXrayConfig(st *Store) error {
+// writeCheckedXrayConfig 先把配置写入临时文件并用 `xray -test` 校验，校验通过后才
+// 原子替换 config.json。这样坏配置（例如某个节点产生 Xray 不接受的 outbound）不会
+// 覆盖上一份可用配置，也使 README 的"配置写入前会进行配置测试"成立。
+func (a *App) writeCheckedXrayConfig(st *Store) error {
+	tmp := a.cfg.XrayConfig() + ".new"
+	if err := a.writeXrayConfigTo(st, tmp); err != nil {
+		return err
+	}
+	if err := a.checkXrayConfigAt(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, a.cfg.XrayConfig())
+}
+
+func (a *App) writeXrayConfigTo(st *Store, path string) error {
 	if st == nil {
 		st = newStore()
 	}
@@ -85,7 +101,7 @@ func (a *App) writeXrayConfig(st *Store) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(a.cfg.XrayConfig(), append(b, '\n'), 0o600)
+	return writeFileAtomic(path, append(b, '\n'), 0o600)
 }
 
 func inbound(tag, listen string, port int, protocol string, settings map[string]any) map[string]any {
@@ -104,7 +120,7 @@ func (a *App) outboundForScene(st *Store, scene Scene, tag string) (map[string]a
 	if n == nil {
 		return nil, fmt.Errorf("节点不存在：%s", id)
 	}
-	pn, err := parseNode(n.RawURL, a.cfg)
+	pn, err := parseNode(n.RawURL)
 	if err != nil {
 		return nil, err
 	}
@@ -112,8 +128,8 @@ func (a *App) outboundForScene(st *Store, scene Scene, tag string) (map[string]a
 	return pn.Outbound, nil
 }
 
-func (a *App) checkXrayConfig() error {
-	if err := runQuietLabel("Xray 配置检查", a.cfg.XrayBin(), "run", "-test", "-config", a.cfg.XrayConfig()); err != nil {
+func (a *App) checkXrayConfigAt(path string) error {
+	if err := runQuietLabel("Xray 配置检查", a.cfg.XrayBin(), "run", "-test", "-config", path); err != nil {
 		return err
 	}
 	fmt.Println("Xray 配置检查通过")
@@ -121,7 +137,7 @@ func (a *App) checkXrayConfig() error {
 }
 
 func (a *App) testNode(n Node) error {
-	pn, err := parseNode(n.RawURL, a.cfg)
+	pn, err := parseNode(n.RawURL)
 	if err != nil {
 		return err
 	}
@@ -157,9 +173,9 @@ func (a *App) testProxy() error {
 			Proxy: http.ProxyURL(proxyURL),
 		},
 	}
-	req, err := http.NewRequest(http.MethodGet, "https://www.google.com/generate_204", nil)
+	req, err := http.NewRequest(http.MethodGet, a.cfg.TestURL, nil)
 	if err != nil {
-		return fmt.Errorf("创建代理测试请求失败")
+		return fmt.Errorf("创建代理测试请求失败：%s", a.cfg.TestURL)
 	}
 	req.Header.Set("User-Agent", "xray-proxy-go/"+Version)
 	start := time.Now()
