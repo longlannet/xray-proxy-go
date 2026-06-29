@@ -58,6 +58,11 @@ func (a *App) addNode(st *Store, raw, name, scope string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("节点链接不能为空")
 	}
+	// 操作员通过 `node add <url> <name>` 或交互菜单直接提供的备注名，与订阅来源的
+	// 节点名走同一条终端转义注入防护边界：在写入前清洗控制字符（见 sanitizeNodeName）。
+	if name != "" {
+		name = sanitizeNodeName(name)
+	}
 	pn, err := parseNode(raw)
 	if err != nil {
 		return "", err
@@ -191,9 +196,13 @@ func parseVMess(raw string) (*parsedNode, error) {
 	}
 	stream := map[string]any{"network": network, "security": security}
 	if security == "tls" {
-		stream["tlsSettings"] = map[string]any{"serverName": firstNonEmpty(stringVal(v, "sni"), addr)}
+		// SNI 回退顺序 sni -> host -> add：VMess 常把伪装域名放在 host、add 填裸 IP
+		// （CDN/域前置），直接回退到 add(IP) 会让 TLS 握手用 IP 作 SNI 而被服务端拒绝。
+		stream["tlsSettings"] = map[string]any{"serverName": firstNonEmpty(stringVal(v, "sni"), stringVal(v, "host"), addr)}
 	}
-	q := url.Values{"host": []string{stringVal(v, "host")}, "path": []string{stringVal(v, "path")}, "serviceName": []string{stringVal(v, "serviceName")}}
+	// VMess gRPC 的 serviceName 按 v2rayN 约定承载在 path 字段（net=grpc 复用 path），
+	// 优先取显式 serviceName，否则回退 path，避免生成空 serviceName 导致 gRPC 连不通。
+	q := url.Values{"host": []string{stringVal(v, "host")}, "path": []string{stringVal(v, "path")}, "serviceName": []string{firstNonEmpty(stringVal(v, "serviceName"), stringVal(v, "path"))}}
 	addTransport(stream, network, q)
 	out := map[string]any{"tag": "", "protocol": "vmess", "settings": map[string]any{"vnext": []any{map[string]any{"address": addr, "port": port, "users": []any{map[string]any{"id": id, "alterId": intVal(v, "aid"), "security": firstNonEmpty(stringVal(v, "scy"), "auto")}}}}}, "streamSettings": stream}
 	return &parsedNode{Protocol: "vmess", Name: sanitizeNodeName(firstNonEmpty(stringVal(v, "ps"), "vmess-"+addr)), EndpointHost: addr, EndpointPort: port, Outbound: out}, nil
@@ -599,7 +608,8 @@ func (a *App) renameNode(st *Store, id, name string) error {
 	if name == "" {
 		return fmt.Errorf("节点备注不能为空")
 	}
-	n.Name = name
+	// 与 addNode 一致：操作员提供的新备注也清洗控制字符，防止终端转义注入。
+	n.Name = sanitizeNodeName(name)
 	n.UpdatedAt = time.Now()
 	if err := a.saveStore(st); err != nil {
 		return err
@@ -788,10 +798,13 @@ func (a *App) speedTest(st *Store) error {
 	sem := make(chan struct{}, 10)
 	var wg sync.WaitGroup
 	for i := range st.Nodes {
+		// 在循环体内先占用信号量再起 goroutine：否则会先为每个节点各起一个 goroutine
+		// 再在内部阻塞等待信号量，使存活 goroutine 数随（可由订阅影响的）节点数线性增长，
+		// 失去并发上限的意义。这样可把同时存活的 goroutine 真正限制在信号量容量内。
+		sem <- struct{}{}
 		wg.Add(1)
 		go func(i int, n Node) {
 			defer wg.Done()
-			sem <- struct{}{}
 			defer func() { <-sem }()
 			start := time.Now()
 			err := a.testNode(n)

@@ -121,6 +121,10 @@ func (a *App) setSceneWithStore(st *Store, scene Scene, enabled bool) error {
 		}
 	}
 	if err := a.saveStore(st); err != nil {
+		// 系统侧改动已生效但状态未能持久化：回滚系统侧（恢复 SceneEnabled、重新
+		// 应用/恢复场景并重新同步核心服务），使磁盘状态与实际系统保持一致，避免
+		// status 误报、boot-restore 重复应用已被拆除的场景。
+		a.rollbackSceneState(st, scene, old)
 		return err
 	}
 	fmt.Printf("%s：%s\n", sceneName(scene), onOff(enabled))

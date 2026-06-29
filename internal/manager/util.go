@@ -2,6 +2,7 @@ package manager
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -14,7 +15,13 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
+
+// externalCmdTimeout 限制读取型外部命令（git/npm 配置读取、getent 用户解析）的执行时间。
+// 这些命令在持有状态锁期间运行，若卡死（NSS 后端慢、npm 经异常代理联网）会连带阻塞
+// 所有并发的 proxyscene 命令，因此给一个宽松但有界的上限。
+const externalCmdTimeout = 30 * time.Second
 
 func envString(key, fallback string) string {
 	if v := os.Getenv(key); strings.TrimSpace(v) != "" {
@@ -113,13 +120,33 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		_ = tmp.Close()
 		return err
 	}
+	// 先 fsync 文件数据再 rename，rename 后再 fsync 父目录：os.Rename 对并发读者是
+	// 原子的但并不保证持久化，崩溃/掉电后可能出现 0 字节或残缺文件。state.json 等的
+	// 崩溃恢复依赖此持久性保证。
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 	if err := os.Chmod(tmpName, perm); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	return fsyncDir(dir)
+}
+
+// fsyncDir 对目录执行 fsync，使其中文件的创建/改名在崩溃后可见（rename 的持久化屏障）。
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // writeUserFileAtomic 以 root 身份在目标用户家目录内原子写入一个属于该用户的文件。
@@ -177,12 +204,18 @@ func writeUserFileAtomic(userName, path string, data []byte, perm os.FileMode) e
 		_ = f.Close()
 		return err
 	}
+	// 与 writeFileAtomic 一致：fsync 文件数据后再 renameat，并 fsync 目录 fd，保证持久性。
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
 	if err := f.Close(); err != nil {
 		return err
 	}
 	if err := syscall.Renameat(dirFD, tmpName, dirFD, base); err != nil {
 		return err
 	}
+	_ = syscall.Fsync(dirFD)
 	committed = true
 	return nil
 }
@@ -337,19 +370,24 @@ func runAsUser(user, name string, args ...string) error {
 }
 
 func outputAsUser(user, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), externalCmdTimeout)
+	defer cancel()
 	var cmd *exec.Cmd
 	if user == "" || user == "root" {
-		cmd = exec.Command(name, args...)
+		cmd = exec.CommandContext(ctx, name, args...)
 	} else if _, err := exec.LookPath("runuser"); err == nil {
 		runArgs := append([]string{"-u", user, "--", name}, args...)
-		cmd = exec.Command("runuser", runArgs...)
+		cmd = exec.CommandContext(ctx, "runuser", runArgs...)
 	} else if _, err := exec.LookPath("sudo"); err == nil {
 		runArgs := append([]string{"-n", "-H", "-u", user, name}, args...)
-		cmd = exec.Command("sudo", runArgs...)
+		cmd = exec.CommandContext(ctx, "sudo", runArgs...)
 	} else {
 		return "", fmt.Errorf("需要 runuser 或 sudo 才能以用户 %s 执行命令", user)
 	}
 	b, err := cmd.Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return string(b), fmt.Errorf("以用户 %s 执行命令 %s 超时（%s）", user, name, externalCmdTimeout)
+	}
 	return string(b), err
 }
 
@@ -391,7 +429,8 @@ func withFileLock(path string, fn func() error) error {
 	if err := ensurePublicDir(filepath.Dir(path)); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	// O_NOFOLLOW：与本仓库其余特权写入一致地拒绝符号链接锁文件，避免 flock 到链接目标。
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return err
 	}
@@ -627,7 +666,9 @@ func getentPasswd(userName string) (string, bool) {
 	if _, err := exec.LookPath("getent"); err != nil {
 		return "", false
 	}
-	out, err := exec.Command("getent", "passwd", userName).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), externalCmdTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "getent", "passwd", userName).Output()
 	if err != nil {
 		return "", false
 	}

@@ -120,7 +120,7 @@ curl -fsSL https://raw.githubusercontent.com/longlannet/proxyscene/main/install.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/longlannet/proxyscene/main/install.sh \
-  | sudo PROXYSCENE_VERSION=v0.4.0 \
+  | sudo PROXYSCENE_VERSION=v0.5.0 \
          PROXYSCENE_MINISIGN_PUBKEY=RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb \
          bash
 ```
@@ -494,7 +494,7 @@ sudo PROXYSCENE_TG_SERVICES='openclaw hermes user:root:hermes-gateway' proxyscen
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `PROXYSCENE_VERSION` | `latest` | 要下载的预编译管理程序版本，例如 `v0.4.0`。 |
+| `PROXYSCENE_VERSION` | `latest` | 要下载的预编译管理程序版本，例如 `v0.5.0`。 |
 | `PROXYSCENE_REPO` | `longlannet/proxyscene` | 预编译二进制所在的 GitHub 仓库 `owner/name`。 |
 | `PROXYSCENE_BASE_URL` | 空 | 自定义预编译下载基址（必须 `https`），优先级高于 `PROXYSCENE_VERSION`/仓库默认地址。 |
 | `PROXYSCENE_MINISIGN_PUBKEY` | 内置发布公钥 | 默认用内置公钥验签（装有 minisign 时 best-effort，缺则跳过并告警、仅校验 SHA256）。显式设置本变量会把验签变为**强制**：缺 minisign 或验签失败即中止。 |

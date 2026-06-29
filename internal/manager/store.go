@@ -30,14 +30,23 @@ func (a *App) loadStore() (*Store, error) {
 		return nil, err
 	}
 	st := newStore()
-	if len(b) > 0 {
-		if err := json.Unmarshal(b, st); err != nil {
-			if recovered, ok := a.loadStoreBackup(); ok {
-				fmt.Printf("警告：状态文件损坏，已从备份恢复：%s\n", path)
-				return recovered, nil
-			}
-			return nil, fmt.Errorf("状态文件损坏且无法从备份恢复（%s）：%w", path, err)
+	if len(b) == 0 {
+		// 状态文件存在但为空：崩溃/掉电可能在 rename 落地后、数据块写回前把目标截断为
+		// 0 字节。与 JSON 损坏一样优先尝试从备份恢复，避免静默清空全部节点与场景状态
+		// （否则下一次 saveStore 会用空状态覆盖备份，造成不可逆丢失）。
+		if recovered, ok := a.loadStoreBackup(); ok {
+			fmt.Printf("警告：状态文件为空，已从备份恢复：%s\n", path)
+			return recovered, nil
 		}
+		normalizeStore(st)
+		return st, nil
+	}
+	if err := json.Unmarshal(b, st); err != nil {
+		if recovered, ok := a.loadStoreBackup(); ok {
+			fmt.Printf("警告：状态文件损坏，已从备份恢复：%s\n", path)
+			return recovered, nil
+		}
+		return nil, fmt.Errorf("状态文件损坏且无法从备份恢复（%s）：%w", path, err)
 	}
 	normalizeStore(st)
 	return st, nil

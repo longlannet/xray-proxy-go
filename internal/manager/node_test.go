@@ -1,10 +1,103 @@
 package manager
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"net"
 	"strings"
 	"testing"
 )
+
+func vmessURL(t *testing.T, m map[string]any) string {
+	t.Helper()
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal vmess: %v", err)
+	}
+	return "vmess://" + base64.StdEncoding.EncodeToString(b)
+}
+
+func vmessStream(t *testing.T, pn *parsedNode) map[string]any {
+	t.Helper()
+	s, ok := pn.Outbound["streamSettings"].(map[string]any)
+	if !ok {
+		t.Fatalf("vmess 缺少 streamSettings：%+v", pn.Outbound)
+	}
+	return s
+}
+
+func TestParseVMessTLSSNIFallsBackToHost(t *testing.T) {
+	// add 是裸 IP、伪装域名在 host：SNI 应回退到 host 而非 IP，否则 TLS 握手被拒。
+	raw := vmessURL(t, map[string]any{
+		"v": "2", "ps": "n", "add": "1.2.3.4", "port": "443",
+		"id":  "11111111-1111-1111-1111-111111111111",
+		"net": "ws", "tls": "tls", "host": "cdn.example.com", "path": "/ws",
+	})
+	pn, err := parseNode(raw)
+	if err != nil {
+		t.Fatalf("parseNode vmess: %v", err)
+	}
+	tls, ok := vmessStream(t, pn)["tlsSettings"].(map[string]any)
+	if !ok {
+		t.Fatalf("缺少 tlsSettings")
+	}
+	if got := tls["serverName"]; got != "cdn.example.com" {
+		t.Fatalf("SNI=%v，期望回退到 host cdn.example.com", got)
+	}
+}
+
+func TestParseVMessGRPCServiceNameFromPath(t *testing.T) {
+	// VMess gRPC 的 serviceName 承载在 path 字段，应据此生成而非空串。
+	raw := vmessURL(t, map[string]any{
+		"v": "2", "add": "example.com", "port": float64(443),
+		"id":  "11111111-1111-1111-1111-111111111111",
+		"net": "grpc", "path": "my-grpc-svc",
+	})
+	pn, err := parseNode(raw)
+	if err != nil {
+		t.Fatalf("parseNode vmess grpc: %v", err)
+	}
+	grpc, ok := vmessStream(t, pn)["grpcSettings"].(map[string]any)
+	if !ok {
+		t.Fatalf("缺少 grpcSettings")
+	}
+	if got := grpc["serviceName"]; got != "my-grpc-svc" {
+		t.Fatalf("grpc serviceName=%v，期望 my-grpc-svc", got)
+	}
+}
+
+func TestAddNodeSanitizesOperatorName(t *testing.T) {
+	a := testApp(t)
+	st := newStore()
+	id, err := a.addNode(st, "trojan://secret@h:443", "ev\x1bil\x07name", "")
+	if err != nil {
+		t.Fatalf("addNode: %v", err)
+	}
+	n := st.findNode(id)
+	if n == nil {
+		t.Fatalf("节点未加入")
+	}
+	if n.Name != "evilname" {
+		t.Fatalf("操作员名未清洗：%q，期望 evilname", n.Name)
+	}
+}
+
+func TestRenameNodeSanitizesName(t *testing.T) {
+	a := testApp(t)
+	st := newStore()
+	id, err := a.addNode(st, "trojan://secret@h:443", "", "")
+	if err != nil {
+		t.Fatalf("addNode: %v", err)
+	}
+	if err := a.renameNode(st, id, "ne\x1bw\x07"); err != nil {
+		t.Fatalf("renameNode: %v", err)
+	}
+	for _, r := range st.findNode(id).Name {
+		if r < 0x20 || r == 0x7f {
+			t.Fatalf("rename 后名称仍含控制字符：%q", st.findNode(id).Name)
+		}
+	}
+}
 
 func TestNewNodeIDUnique(t *testing.T) {
 	seen := map[string]bool{}

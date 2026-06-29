@@ -44,7 +44,11 @@ fatal() { printf '[%s] 错误：%s\n' "$SCRIPT_NAME" "$*" >&2; exit 1; }
 run_quiet() {
   local desc="$1"
   shift
-  if ! "$@" >/dev/null 2>&1; then
+  # 丢弃 stdout，但在失败时回放 stderr：否则 minisign 验签失败、go 编译错误、apt 锁等
+  # root 操作失败只会显示笼统的“失败”，操作员无法区分被篡改的签名与一次网络抖动。
+  local err
+  if ! err="$("$@" 2>&1 >/dev/null)"; then
+    [[ -n "$err" ]] && printf '%s\n' "$err" >&2
     fatal "${desc}失败"
   fi
 }
@@ -64,10 +68,11 @@ usage() {
     minisign -Vm <包>.tar.gz -x <包>.tar.gz.minisig -P <公钥>
 
 管理程序获取方式（默认优先下载预编译二进制，目标机无需 Go；失败时回退源码编译）：
-  PROXYSCENE_VERSION=latest                    要下载的预编译版本，如 v0.4.0
+  PROXYSCENE_VERSION=latest                    要下载的预编译版本，如 v0.5.0
   PROXYSCENE_REPO=longlannet/proxyscene     预编译二进制所在的 GitHub 仓库 owner/name
   PROXYSCENE_BASE_URL=https://mirror/dl         自定义预编译下载基址（必须 https），优先级最高
   PROXYSCENE_MINISIGN_PUBKEY=RWxxxx             用 minisign 校验签名（联机校验 checksums.txt，离线校验整合包）
+  PROXYSCENE_ALLOW_UNSIGNED=1                   minisign 不可用时仅用 SHA256 安装预编译二进制（默认 fail-closed，不推荐）
   PROXYSCENE_BUILD_FROM_SOURCE=1                跳过预编译下载，强制本地源码编译
 
 常用环境变量：
@@ -82,7 +87,8 @@ usage() {
                                              管理程序安装路径
   XRAY_DOWNLOAD_SOURCE=official                Xray 下载源，可选 official 或 xxv
   XRAY_ZIP_URL=https://example.com/xray.zip    自定义 Xray zip 下载地址，优先级高于预设下载源
-  XRAY_ZIP_SHA256=...                          Xray zip SHA256；使用自定义或 xxv 源时建议设置
+  XRAY_ZIP_SHA256=...                          Xray zip SHA256；自定义或 xxv 源必须设置（否则 fail-closed 拒绝安装）
+  ALLOW_UNVERIFIED_XRAY=1                       无法校验 Xray 完整性时仍安装（默认 fail-closed，不推荐）
   SKIP_XRAY_INSTALL=1                         不安装 Xray，要求核心目录已有可执行 xray
   SKIP_MANAGER_INIT=1                         只安装依赖和程序，不执行管理器初始化
 EOF
@@ -172,6 +178,29 @@ install_packages() {
     run_quiet "安装基础依赖" zypper --non-interactive install "${missing[@]}"
   else
     fatal "无法自动安装基础依赖，请手动安装：${missing[*]}"
+  fi
+}
+
+# ensure_minisign_best_effort 在默认（下载预编译）路径下尽力安装 minisign，使发布签名
+# 默认即可校验。失败不致命：装不上时由 install_manager_prebuilt 决定 fail-closed 或要求
+# 显式 PROXYSCENE_ALLOW_UNSIGNED=1，避免在缺少 minisign 包的发行版上直接卡死安装。
+ensure_minisign_best_effort() {
+  [[ "$BUILD_FROM_SOURCE" == "1" ]] && return 0
+  [[ -n "$MANAGER_MINISIGN_PUBKEY" ]] || return 0
+  need_cmd minisign && return 0
+  log "尝试安装 minisign 以校验发布签名（失败不影响后续，可设 PROXYSCENE_ALLOW_UNSIGNED=1 仅用 SHA256）"
+  if need_cmd apt-get; then
+    env DEBIAN_FRONTEND=noninteractive apt-get install -y minisign >/dev/null 2>&1 || true
+  elif need_cmd dnf; then
+    dnf install -y minisign >/dev/null 2>&1 || true
+  elif need_cmd yum; then
+    yum install -y minisign >/dev/null 2>&1 || true
+  elif need_cmd apk; then
+    apk add --no-cache minisign >/dev/null 2>&1 || true
+  elif need_cmd zypper; then
+    zypper --non-interactive install minisign >/dev/null 2>&1 || true
+  elif need_cmd pacman; then
+    pacman -Sy --noconfirm minisign >/dev/null 2>&1 || true
   fi
 }
 
@@ -409,8 +438,12 @@ install_xray() {
   if [[ -n "$expected" ]]; then
     verify_sha256_file "Xray" "$zip" "$expected"
     log "Xray SHA256 校验通过"
+  elif [[ "${ALLOW_UNVERIFIED_XRAY:-0}" == "1" ]]; then
+    log "警告：已通过 ALLOW_UNVERIFIED_XRAY=1 跳过 Xray 完整性校验，安装未经验证的二进制（自担风险）"
   else
-    log "警告：未校验 Xray 完整性（未提供 XRAY_ZIP_SHA256，且无法自动获取官方校验和）；建议设置 XRAY_ZIP_SHA256"
+    # Xray 以特权代理核心身份由 systemd 运行；无法校验完整性时 fail-closed，
+    # 避免被篡改/MITM 的下载源（如自定义 URL 或镜像源）直接获得 root 代码执行。
+    fatal "无法校验 Xray 完整性（未提供 XRAY_ZIP_SHA256 且该下载源无官方校验和）。请设置 XRAY_ZIP_SHA256，或改用官方源 XRAY_DOWNLOAD_SOURCE=official，或显式 ALLOW_UNVERIFIED_XRAY=1 自担风险安装。"
   fi
 
   run_quiet "解压 Xray" unzip -oq "$zip" -d "$tmp/xray"
@@ -483,6 +516,8 @@ install_manager_prebuilt() {
   base="$(release_base_url)"
   asset="proxyscene_linux_${arch}.tar.gz"
   tmp="$(mktemp -d)"
+  # 覆盖所有 fatal/exit 退出路径的临时目录清理（成功路径在 return 前清除该 trap）。
+  trap 'rm -rf "$tmp"' EXIT
 
   log "下载预编译管理程序：$base/$asset"
   if ! fetch_https "$base/$asset" "$tmp/$asset" 104857600; then
@@ -507,10 +542,13 @@ install_manager_prebuilt() {
       log "未获取到签名文件，跳过签名校验（仍会校验 SHA256）"
     fi
   elif [[ "$MANAGER_MINISIGN_REQUIRED" == "1" ]]; then
-    rm -rf "$tmp"
     fatal "设置了 PROXYSCENE_MINISIGN_PUBKEY 但未找到 minisign"
+  elif [[ "${PROXYSCENE_ALLOW_UNSIGNED:-0}" == "1" ]]; then
+    log "警告：PROXYSCENE_ALLOW_UNSIGNED=1，未做签名校验，仅校验 SHA256（镜像等不可信源可同源篡改 SHA256 与二进制，自担风险）。"
   else
-    log "警告：未安装 minisign，跳过签名校验，仅校验 SHA256。镜像等不可信源可能同源篡改 SHA256 与二进制；如需密码学保证，请安装 minisign 或设置 PROXYSCENE_MINISIGN_PUBKEY 强制验签。"
+    # 随发布内置了公钥，默认应做密码学验签。minisign 缺失时 fail-closed：要么安装
+    # minisign（install_packages 已尽力自动安装），要么显式 PROXYSCENE_ALLOW_UNSIGNED=1。
+    fatal "未安装 minisign，无法对发布产物做密码学验签。请安装 minisign（Debian/Ubuntu/Alpine/Arch 包名均为 minisign），或显式设置 PROXYSCENE_ALLOW_UNSIGNED=1 仅用 SHA256 安装（不推荐）。"
   fi
 
   # checksums.txt 每行形如 "<64hex>  <asset>"（二进制模式为 "<hex> *<asset>"）。
@@ -526,6 +564,7 @@ install_manager_prebuilt() {
   run_quiet "安装管理程序" install -D -m 755 "$tmp/proxyscene" "$INSTALL_BIN"
   log "预编译管理程序已安装：$INSTALL_BIN（版本 $("$INSTALL_BIN" version 2>/dev/null || echo 未知)）"
   rm -rf "$tmp"
+  trap - EXIT
   return 0
 }
 
@@ -644,6 +683,7 @@ main() {
   fi
   require_root
   install_packages
+  ensure_minisign_best_effort
   install_xray
   install_manager
   init_manager

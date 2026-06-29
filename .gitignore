@@ -2,7 +2,7 @@
 /dist/
 /bin/
 /build/
-/xray-proxy
+/proxyscene
 *.exe
 *.test
 *.out
@@ -41,9 +41,12 @@ coverage.out
 *.dat
 
 # Installer temporary build output
-/.xray-proxy-build.*
+/.proxyscene-build.*
 
 # Local environment files
 .env
 .env.*
 !.env.example
+
+# 本地维护者/内部文档（不上传 GitHub）
+*.local.md
