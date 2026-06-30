@@ -129,7 +129,10 @@ func (a *App) outboundForScene(st *Store, scene Scene, tag string) (map[string]a
 }
 
 func (a *App) checkXrayConfigAt(path string) error {
-	if err := runQuietLabel("Xray 配置检查", a.cfg.XrayBin(), "run", "-test", "-config", path); err != nil {
+	// 必须显式 -format json：临时文件名是 config.json.new，Xray 默认按扩展名推断格式，
+	// 而 ".new" 不是已知格式，会以 "Failed to get format" 报错（exit 23）导致任何场景都无法启用。
+	// proxyscene 始终生成 JSON，固定指定格式既正确又与临时文件名解耦。
+	if err := runQuietLabel("Xray 配置检查", a.cfg.XrayBin(), "run", "-test", "-format", "json", "-config", path); err != nil {
 		return err
 	}
 	fmt.Println("Xray 配置检查通过")
