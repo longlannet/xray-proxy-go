@@ -265,16 +265,25 @@ func (a *App) applyTelegram() error {
 	if len(targets) == 0 {
 		return fmt.Errorf("没有可注入的 OpenClaw/Hermes systemd 目标服务")
 	}
+	// 系统级 user-unit 目录里的 Telegram 客户端无法确定作用用户，提示操作员显式指定。
+	warnSystemWideUserTelegramUnits()
 	content := telegramProxyEnvContent(a.cfg)
-	if err := writeFileAtomic("/etc/openclaw-hermes-tg-proxy.env", []byte(content), 0o600); err != nil {
+	envChanged, err := writeFileAtomicIfChanged("/etc/openclaw-hermes-tg-proxy.env", []byte(content), 0o600)
+	if err != nil {
 		return err
 	}
 	dropIn := "[Service]\nEnvironmentFile=/etc/openclaw-hermes-tg-proxy.env\n"
 	proxyURL := a.cfg.HTTPAddr(SceneTelegram)
 	manageOpenClaw := envBool("PROXYSCENE_MANAGE_OPENCLAW_CONFIG", true)
 	userManagers := map[string]bool{}
-	openClawRestart := []systemdTargetName{} // openclaw 目标中配置确有改动、需重启以重载的
+	warnedBus := map[string]bool{}
+	restart := []systemdTargetName{} // 只重启确有改动的目标
 	for _, target := range targets {
+		// 用户级目标需要其 systemd 用户总线在运行（linger/已登录）才能注入/重启生效，先做可见提示。
+		if target.UserMode && !warnedBus[target.User] {
+			warnIfUserBusMissing(target.User)
+			warnedBus[target.User] = true
+		}
 		// OpenClaw 不读 TELEGRAM_*，env 注入对它无效；改其 channels.telegram.proxy 配置实现仅代理 Telegram。
 		if a.isOpenClawTarget(target) {
 			if !manageOpenClaw {
@@ -286,7 +295,7 @@ func (a *App) applyTelegram() error {
 					return err
 				}
 				if changed {
-					openClawRestart = append(openClawRestart, target)
+					restart = append(restart, target)
 				}
 			} else if systemUnitExists(target.Service) {
 				fmt.Printf("警告：系统级 openclaw 单元 %s 无法确定配置归属用户，已跳过，请手动设置 channels.telegram.proxy=%s\n", target.Service, proxyURL)
@@ -299,14 +308,24 @@ func (a *App) applyTelegram() error {
 				return err
 			}
 			userDropIn := "[Service]\n" + telegramProxySystemdEnvironmentLines(a.cfg)
-			if err := writeUserFileAtomic(target.User, path, []byte(userDropIn), 0o644); err != nil {
+			changed, err := writeUserFileAtomicIfChanged(target.User, path, []byte(userDropIn), 0o644)
+			if err != nil {
 				return err
 			}
 			userManagers[target.User] = true
+			if changed {
+				restart = append(restart, target)
+			}
 			continue
 		}
-		if err := writeFileAtomic(a.cfg.TelegramDropInPath(target.Service), []byte(dropIn), 0o644); err != nil {
+		// 系统级 hermes：drop-in 内容固定（EnvironmentFile=），仅在 drop-in 新建或共享 env 文件
+		// 内容变化时才需重启。
+		changed, err := writeFileAtomicIfChanged(a.cfg.TelegramDropInPath(target.Service), []byte(dropIn), 0o644)
+		if err != nil {
 			return err
+		}
+		if changed || envChanged {
+			restart = append(restart, target)
 		}
 	}
 	if err := runQuietLabel("重新加载 systemd 配置", "systemctl", "daemon-reload"); err != nil {
@@ -315,25 +334,33 @@ func (a *App) applyTelegram() error {
 	for userName := range userManagers {
 		runUserSystemctlWarn(userName, "重新加载用户级 systemd 配置", "daemon-reload")
 	}
-	a.restartTelegramTargets(targets, openClawRestart)
+	a.restartTelegramTargets(restart)
 	return nil
 }
 
-// restartTelegramTargets 重启注入了 env drop-in 的目标（hermes 等），openclaw 目标则只重启
-// 配置确有改动的（在 changedOpenClaw 中），避免在配置未变时无谓地把整个 openclaw 网关弹一次。
-func (a *App) restartTelegramTargets(targets, changedOpenClaw []systemdTargetName) {
-	for _, target := range targets {
-		if a.isOpenClawTarget(target) {
-			continue // openclaw 按需单独重启（见下）
-		}
+// restartTelegramTargets 只重启确有改动（drop-in 内容变化或 openclaw 配置变化）的目标，
+// 避免在内容未变时无谓地把网关弹一次。
+func (a *App) restartTelegramTargets(restart []systemdTargetName) {
+	for _, target := range restart {
 		if target.UserMode {
 			runUserSystemctlWarn(target.User, "重启用户级服务 "+target.Service, "try-restart", "--", target.Service)
 			continue
 		}
 		_ = runQuiet("systemctl", "try-restart", "--", target.Service)
 	}
-	for _, target := range changedOpenClaw {
-		runUserSystemctlWarn(target.User, "重启 openclaw 以加载配置 "+target.Service, "try-restart", "--", target.Service)
+}
+
+// warnSystemWideUserTelegramUnits 扫描系统级 user-unit 目录（这些单元对所有用户的
+// systemctl --user 生效），若发现疑似 Telegram 客户端单元，提示无法自动判定作用用户、
+// 请用 PROXYSCENE_TG_SERVICES 显式指定 user:用户名:服务名。
+func warnSystemWideUserTelegramUnits() {
+	for _, root := range []string{"/etc/systemd/user", "/usr/local/lib/systemd/user", "/lib/systemd/user", "/usr/lib/systemd/user"} {
+		walkTelegramUnitFiles(root, func(path, service string) {
+			if !isTelegramRelatedUnit(path, service) {
+				return
+			}
+			fmt.Printf("提示：发现系统级用户单元 %s（%s），它对所有用户的 systemctl --user 生效，无法自动判定作用用户，已跳过；如需接管请显式设置 PROXYSCENE_TG_SERVICES='user:用户名:%s'\n", service, root, service)
+		})
 	}
 }
 
@@ -379,7 +406,7 @@ func (a *App) restoreTelegram() error {
 	}
 	proxyURL := a.cfg.HTTPAddr(SceneTelegram)
 	userManagers := map[string]bool{}
-	openClawRestart := []systemdTargetName{} // openclaw 目标中配置确有还原、需重启以重载的
+	restart := []systemdTargetName{} // 只重启确有清理（drop-in 删除 / openclaw 配置还原）的目标
 	for _, target := range targets {
 		if a.isOpenClawTarget(target) {
 			// 还原 openclaw 配置（仅当当前值仍是我们设置的托管值），并顺带清理旧版本可能写入的无效 drop-in。
@@ -388,12 +415,12 @@ func (a *App) restoreTelegram() error {
 				if err != nil {
 					fmt.Printf("警告：还原用户 %s 的 openclaw Telegram 代理配置失败：%v\n", target.User, err)
 				}
-				if changed {
-					openClawRestart = append(openClawRestart, target)
-				}
 				if path, err := a.cfg.UserTelegramDropInPath(target.User, target.Service); err == nil {
 					_ = os.Remove(path)
 					_ = os.Remove(filepath.Dir(path))
+				}
+				if changed {
+					restart = append(restart, target)
 				}
 			}
 			continue
@@ -401,20 +428,26 @@ func (a *App) restoreTelegram() error {
 		if target.UserMode {
 			path, err := a.cfg.UserTelegramDropInPath(target.User, target.Service)
 			if err == nil {
-				_ = os.Remove(path)
+				removed := removeFileReport(path)
 				// 删除清空后的 .service.d 目录；目录非空（有其他 drop-in）时 Remove 失败，忽略。
 				_ = os.Remove(filepath.Dir(path))
+				userManagers[target.User] = true
+				if removed {
+					restart = append(restart, target)
+				}
 			}
-			userManagers[target.User] = true
 			continue
 		}
-		_ = os.Remove(a.cfg.TelegramDropInPath(target.Service))
+		removed := removeFileReport(a.cfg.TelegramDropInPath(target.Service))
 		_ = os.Remove(a.cfg.TelegramDropInDir(target.Service))
+		if removed {
+			restart = append(restart, target)
+		}
 	}
 	_ = runQuietLabel("重新加载 systemd 配置", "systemctl", "daemon-reload")
 	for userName := range userManagers {
 		runUserSystemctlWarn(userName, "重新加载用户级 systemd 配置", "daemon-reload")
 	}
-	a.restartTelegramTargets(targets, openClawRestart)
+	a.restartTelegramTargets(restart)
 	return nil
 }

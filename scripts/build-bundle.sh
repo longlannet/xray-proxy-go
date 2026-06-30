@@ -15,7 +15,7 @@
 #   VERSION             版本号（默认取 git describe；自动去掉前导 v）
 #   COMMIT              提交哈希（默认取 git rev-parse HEAD）
 #   DIST                产物输出目录（默认 dist）
-#   XRAY_RELEASE_BASE   Xray 发布下载基地址（默认 XTLS latest）
+#   XRAY_RELEASE_BASE   Xray 发布下载基地址（默认固定到某 vX.Y.Z 以保证可复现构建）
 set -euo pipefail
 
 # 切换到仓库根目录，使 install.sh / NOTICE / LICENSE / ./cmd 等相对路径稳定可解析。
@@ -27,7 +27,8 @@ VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo d
 VERSION="${VERSION#v}"
 COMMIT="${COMMIT:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
 DIST="${DIST:-dist}"
-XRAY_RELEASE_BASE="${XRAY_RELEASE_BASE:-https://github.com/XTLS/Xray-core/releases/latest/download}"
+# 固定 Xray 版本以保证可复现构建（升级时与 release.yml/install.sh 一起手动 bump）。
+XRAY_RELEASE_BASE="${XRAY_RELEASE_BASE:-https://github.com/XTLS/Xray-core/releases/download/v26.3.27}"
 
 LDFLAGS="-s -w -X proxyscene/internal/manager.Version=${VERSION} -X proxyscene/internal/manager.Commit=${COMMIT}"
 

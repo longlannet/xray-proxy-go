@@ -120,7 +120,7 @@ curl -fsSL https://raw.githubusercontent.com/longlannet/proxyscene/main/install.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/longlannet/proxyscene/main/install.sh \
-  | sudo PROXYSCENE_VERSION=v0.6.0 \
+  | sudo PROXYSCENE_VERSION=v0.6.1 \
          PROXYSCENE_MINISIGN_PUBKEY=RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb \
          bash
 ```
@@ -494,7 +494,7 @@ sudo PROXYSCENE_TG_SERVICES='openclaw hermes user:root:hermes-gateway' proxyscen
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `PROXYSCENE_VERSION` | `latest` | 要下载的预编译管理程序版本，例如 `v0.6.0`。 |
+| `PROXYSCENE_VERSION` | `latest` | 要下载的预编译管理程序版本，例如 `v0.6.1`。 |
 | `PROXYSCENE_REPO` | `longlannet/proxyscene` | 预编译二进制所在的 GitHub 仓库 `owner/name`。 |
 | `PROXYSCENE_BASE_URL` | 空 | 自定义预编译下载基址（必须 `https`），优先级高于 `PROXYSCENE_VERSION`/仓库默认地址。 |
 | `PROXYSCENE_MINISIGN_PUBKEY` | 内置发布公钥 | 默认用内置公钥验签（装有 minisign 时 best-effort，缺则跳过并告警、仅校验 SHA256）。显式设置本变量会把验签变为**强制**：缺 minisign 或验签失败即中止。 |
@@ -508,10 +508,11 @@ sudo PROXYSCENE_TG_SERVICES='openclaw hermes user:root:hermes-gateway' proxyscen
 | `PROXYSCENE_MANAGER_DIR` | `/opt/proxyscene` | 管理器核心目录；必须位于 `/opt`、`/var/lib` 或 `/var/opt` 下的专用目录，不能指向系统目录或用户家目录。 |
 | `PROXYSCENE_SWITCH_BIN` | `/usr/local/bin/proxyscene` | 管理程序安装路径。 |
 | `XRAY_DOWNLOAD_SOURCE` | `official` | Xray 预设下载源；可选 `official`（官方 GitHub Release）或 `xxv`（`xxv.cc` 镜像）。 |
-| `XRAY_GITHUB_RELEASE_BASE` | `https://github.com/XTLS/Xray-core/releases/latest/download` | 官方 Xray 发布下载基础地址。 |
+| `XRAY_GITHUB_RELEASE_BASE` | `https://github.com/XTLS/Xray-core/releases/download/v26.3.27` | 官方 Xray 发布下载基础地址（默认固定版本以保证可复现）。 |
 | `XRAY_XXV_ZIP_URL` | `https://xxv.cc/7c9fxLN4nm4BFU8fjD.zip` | `xxv.cc` Xray zip 镜像地址。 |
-| `XRAY_ZIP_URL` | 空 | 自定义 Xray zip 下载地址；非空时优先级高于 `XRAY_DOWNLOAD_SOURCE`。使用自定义地址时建议同时设置 `XRAY_ZIP_SHA256`。 |
-| `XRAY_ZIP_SHA256` | 空 | Xray zip 的 SHA256；非空时安装脚本会校验。使用官方源时留空，安装脚本会自动拉取官方 `.dgst` 校验文件并校验；使用 `xxv` 或自定义下载源时建议显式设置。 |
+| `XRAY_XXV_ZIP_SHA256` | 内置 | `xxv` 镜像 zip 的 SHA256；脚本已内置固定值，默认即校验（镜像与官方 amd64 zip 字节一致）。 |
+| `XRAY_ZIP_URL` | 空 | 自定义 Xray zip 下载地址；非空时优先级高于 `XRAY_DOWNLOAD_SOURCE`。使用自定义地址时必须设置 `XRAY_ZIP_SHA256`（否则 fail-closed 拒绝安装）。 |
+| `XRAY_ZIP_SHA256` | 空 | Xray zip 的 SHA256；非空时安装脚本会校验。官方源自动拉取 `.dgst` 校验、`xxv` 源用内置 `XRAY_XXV_ZIP_SHA256`，二者均无需设置；仅自定义 `XRAY_ZIP_URL` 必须显式设置。 |
 | `SKIP_XRAY_INSTALL` | `0` | 设为 `1` 时跳过 Xray 安装，要求核心目录已有可执行 `xray`。 |
 | `SKIP_MANAGER_INIT` | `0` | 设为 `1` 时只安装依赖和程序，不调用管理器初始化。 |
 
@@ -525,7 +526,7 @@ sudo XRAY_DOWNLOAD_SOURCE=official bash ./install.sh
 sudo XRAY_DOWNLOAD_SOURCE=xxv bash ./install.sh
 ```
 
-安装脚本会校验 Go 安装包 SHA256，并会拒绝把核心目录设置为 `/etc`、`/usr`、`/home`、`/root`、`/tmp` 等敏感系统路径。对于已经存在的核心目录，安装脚本不会再无条件修改目录权限；只有新建核心目录时才设置为 `0700`。Xray 默认从官方 GitHub Release 下载，并会自动拉取同目录的官方 `.dgst` 校验文件校验 SHA256；如果需要使用 `xxv.cc` 镜像，可以设置 `XRAY_DOWNLOAD_SOURCE=xxv`。使用 `xxv` 或自定义 `XRAY_ZIP_URL` 下载源时，官方 `.dgst` 不可用，建议显式设置 `XRAY_ZIP_SHA256`，避免下载内容被篡改。
+安装脚本会校验 Go 安装包 SHA256，并会拒绝把核心目录设置为 `/etc`、`/usr`、`/home`、`/root`、`/tmp` 等敏感系统路径。对于已经存在的核心目录，安装脚本不会再无条件修改目录权限；只有新建核心目录时才设置为 `0700`。Xray 默认从官方 GitHub Release 的**固定版本**下载（可复现），并自动拉取同目录的官方 `.dgst` 校验 SHA256；`xxv.cc` 镜像（`XRAY_DOWNLOAD_SOURCE=xxv`）用脚本内置的固定 SHA256 校验，默认即可验证。只有使用自定义 `XRAY_ZIP_URL` 时官方校验不可用，**必须**显式设置 `XRAY_ZIP_SHA256`，否则脚本 fail-closed 拒绝安装（除非 `ALLOW_UNVERIFIED_XRAY=1`）。
 
 ### 运行期变量
 

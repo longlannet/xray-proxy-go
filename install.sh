@@ -8,7 +8,12 @@ DEFAULT_INSTALL_BIN="/usr/local/bin/proxyscene"
 DEFAULT_XRAY_DOWNLOAD_SOURCE="official"
 DEFAULT_XRAY_ZIP_URL=""
 DEFAULT_XRAY_XXV_ZIP_URL="https://xxv.cc/7c9fxLN4nm4BFU8fjD.zip"
-DEFAULT_XRAY_GITHUB_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/latest/download"
+# xxv 镜像当前与官方 amd64 Xray-linux-64.zip 字节一致；固定其 SHA256 使该路径默认可校验
+# （xxv 用于屏蔽 GitHub 的环境，无法回连官方 .dgst，故只能内置常量）。刷新镜像/升级 Xray 时
+# 与下面的固定版本一起 bump。
+DEFAULT_XRAY_XXV_ZIP_SHA256="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
+# 固定 Xray 版本以保证可复现安装（与 release.yml/build-bundle.sh 一起手动 bump）。
+DEFAULT_XRAY_GITHUB_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/download/v26.3.27"
 # 本项目 Release 的 minisign 公钥；离线安装默认用它验签离线整合包。
 DEFAULT_MANAGER_MINISIGN_PUBKEY="RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb"
 
@@ -20,6 +25,7 @@ CORE_DIR="${PROXYSCENE_MANAGER_DIR:-$DEFAULT_CORE_DIR}"
 INSTALL_BIN="${PROXYSCENE_SWITCH_BIN:-$DEFAULT_INSTALL_BIN}"
 XRAY_ZIP_URL="${XRAY_ZIP_URL:-$DEFAULT_XRAY_ZIP_URL}"
 XRAY_XXV_ZIP_URL="${XRAY_XXV_ZIP_URL:-$DEFAULT_XRAY_XXV_ZIP_URL}"
+XRAY_XXV_ZIP_SHA256="${XRAY_XXV_ZIP_SHA256:-$DEFAULT_XRAY_XXV_ZIP_SHA256}"
 XRAY_GITHUB_RELEASE_BASE="${XRAY_GITHUB_RELEASE_BASE:-$DEFAULT_XRAY_GITHUB_RELEASE_BASE}"
 XRAY_DOWNLOAD_SOURCE="${XRAY_DOWNLOAD_SOURCE:-$DEFAULT_XRAY_DOWNLOAD_SOURCE}"
 XRAY_ZIP_SHA256="${XRAY_ZIP_SHA256:-}"
@@ -68,7 +74,7 @@ usage() {
     minisign -Vm <包>.tar.gz -x <包>.tar.gz.minisig -P <公钥>
 
 管理程序获取方式（默认优先下载预编译二进制，目标机无需 Go；失败时回退源码编译）：
-  PROXYSCENE_VERSION=latest                    要下载的预编译版本，如 v0.6.0
+  PROXYSCENE_VERSION=latest                    要下载的预编译版本，如 v0.6.1
   PROXYSCENE_REPO=longlannet/proxyscene     预编译二进制所在的 GitHub 仓库 owner/name
   PROXYSCENE_BASE_URL=https://mirror/dl         自定义预编译下载基址（必须 https），优先级最高
   PROXYSCENE_MINISIGN_PUBKEY=RWxxxx             用 minisign 校验签名（联机校验 checksums.txt，离线校验整合包）
@@ -87,7 +93,7 @@ usage() {
                                              管理程序安装路径
   XRAY_DOWNLOAD_SOURCE=official                Xray 下载源，可选 official 或 xxv
   XRAY_ZIP_URL=https://example.com/xray.zip    自定义 Xray zip 下载地址，优先级高于预设下载源
-  XRAY_ZIP_SHA256=...                          Xray zip SHA256；自定义或 xxv 源必须设置（否则 fail-closed 拒绝安装）
+  XRAY_ZIP_SHA256=...                          Xray zip SHA256；自定义 XRAY_ZIP_URL 必须设置（否则 fail-closed）。官方与 xxv 源已内置校验
   ALLOW_UNVERIFIED_XRAY=1                       无法校验 Xray 完整性时仍安装（默认 fail-closed，不推荐）
   SKIP_XRAY_INSTALL=1                         不安装 Xray，要求核心目录已有可执行 xray
   SKIP_MANAGER_INIT=1                         只安装依赖和程序，不执行管理器初始化
@@ -334,8 +340,9 @@ xray_download_url() {
 
 # xray_expected_sha256 解析期望的 Xray zip SHA256：
 #   1) 显式设置的 XRAY_ZIP_SHA256 优先；
-#   2) 否则在使用官方源（未自定义 XRAY_ZIP_URL）时，尝试拉取官方 .dgst 校验文件并提取 SHA256；
-#   3) 其余情况返回空（由调用方决定是否仅警告）。
+#   2) 官方源（未自定义 XRAY_ZIP_URL）：拉取官方 .dgst 校验文件并提取 SHA256；
+#   3) xxv 镜像源：用内置的固定 XRAY_XXV_ZIP_SHA256（镜像即官方 amd64 zip，屏蔽 GitHub 时也能校验）；
+#   4) 其余情况返回空（由调用方 fail-closed 或 opt-out）。
 xray_expected_sha256() {
   local url="$1"
   if [[ -n "$XRAY_ZIP_SHA256" ]]; then
@@ -355,6 +362,11 @@ xray_expected_sha256() {
         if is_sha256_hex "$checksum"; then
           printf '%s\n' "$checksum"
         fi
+      fi
+      ;;
+    xxv|xxv.cc|mirror)
+      if is_sha256_hex "$XRAY_XXV_ZIP_SHA256"; then
+        printf '%s\n' "$XRAY_XXV_ZIP_SHA256"
       fi
       ;;
   esac

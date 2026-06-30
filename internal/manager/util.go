@@ -2,6 +2,7 @@ package manager
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -390,9 +391,37 @@ func openExistingUserDirChain(home, rel string) (int, error) {
 	return current, nil
 }
 
+// externalCommandTimeout 给一般外部命令（systemctl、git/npm 写、useradd 等）一个宽松上限。
+// 取 5 分钟：远高于 systemd 默认的 stop+start 超时（各 90s），只用于兜住真正卡死的调用，
+// 避免它们在持有状态锁时无限阻塞所有并发的 proxyscene 命令。
+const externalCommandTimeout = 5 * time.Minute
+
 func runQuiet(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	return cmd.Run()
+	ctx, cancel := context.WithTimeout(context.Background(), externalCommandTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).Run()
+}
+
+// writeFileAtomicIfChanged 仅在目标内容与 data 不同时才原子写入，返回是否实际写入。
+// 用于避免在内容未变时无谓地改文件 mtime / 触发依赖该文件的服务重启。
+func writeFileAtomicIfChanged(path string, data []byte, perm os.FileMode) (bool, error) {
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, data) {
+		return false, nil
+	}
+	return true, writeFileAtomic(path, data, perm)
+}
+
+// writeUserFileAtomicIfChanged 是 writeFileAtomicIfChanged 的用户家目录变体（读用 O_NOFOLLOW）。
+func writeUserFileAtomicIfChanged(userName, path string, data []byte, perm os.FileMode) (bool, error) {
+	if existing, err := readUserFileNoFollow(userName, path, maxOpenClawConfigBytes); err == nil && bytes.Equal(existing, data) {
+		return false, nil
+	}
+	return true, writeUserFileAtomic(userName, path, data, perm)
+}
+
+// removeFileReport 删除文件，返回该文件此前是否存在（用于判断是否需要重启依赖它的服务）。
+func removeFileReport(path string) bool {
+	return os.Remove(path) == nil
 }
 
 func runQuietLabel(label, name string, args ...string) error {
@@ -400,11 +429,16 @@ func runQuietLabel(label, name string, args ...string) error {
 }
 
 func runQuietEnvLabel(label string, env []string, name string, args ...string) error {
-	cmd := exec.Command(name, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), externalCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
 	}
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("%s超时（%s）", label, externalCommandTimeout)
+		}
 		return commandFailed(label, err)
 	}
 	return nil
@@ -811,6 +845,25 @@ func runUserSystemctlWarn(userName, label string, args ...string) {
 	if err := runUserSystemctlQuiet(userName, args...); err != nil {
 		fmt.Printf("警告：%s 失败：%v\n", label, err)
 	}
+}
+
+// userBusAvailable 报告目标用户的 systemd 用户总线（/run/user/<uid>/bus）是否在运行。
+func userBusAvailable(userName string) bool {
+	uid, _, err := lookupLocalUser(userName)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat("/run/user/" + uid + "/bus")
+	return err == nil
+}
+
+// warnIfUserBusMissing 在目标用户没有可用 systemd 用户总线时打印明确指引：用户级注入此时
+// 不会生效、开机也不会自动恢复，需 loginctl enable-linger。把"静默跳过"升级为可见前置提示。
+func warnIfUserBusMissing(userName string) {
+	if userBusAvailable(userName) {
+		return
+	}
+	fmt.Printf("提示：用户 %s 的 systemd 用户总线未运行——其用户级 Telegram 代理注入暂不会生效，开机也不会自动恢复；请先执行：loginctl enable-linger %s\n", userName, userName)
 }
 
 func validPort(port int, field string) error {

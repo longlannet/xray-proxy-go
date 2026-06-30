@@ -13,7 +13,9 @@ jobs:
     name: Build and publish release
     runs-on: ubuntu-latest
     env:
-      XRAY_PROXY_MINISIGN_SECRET_KEY: ${{ secrets.XRAY_PROXY_MINISIGN_SECRET_KEY }}
+      # 优先用新名 PROXYSCENE_MINISIGN_SECRET_KEY，回退旧名 XRAY_PROXY_MINISIGN_SECRET_KEY，
+      # 以便平滑改名：可先在仓库 Settings 新增同值的 PROXYSCENE_MINISIGN_SECRET_KEY，再删旧的。
+      PROXYSCENE_MINISIGN_SECRET_KEY: ${{ secrets.PROXYSCENE_MINISIGN_SECRET_KEY || secrets.XRAY_PROXY_MINISIGN_SECRET_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -29,7 +31,9 @@ jobs:
       - name: Build artifacts
         shell: bash
         env:
-          XRAY_RELEASE_BASE: https://github.com/XTLS/Xray-core/releases/latest/download
+          # 固定 Xray 版本以保证可复现构建（不跟 latest 漂移）。升级 Xray 时手动 bump 此处、
+          # build-bundle.sh、install.sh 的默认值（以及 xxv 镜像 SHA256）。
+          XRAY_RELEASE_BASE: https://github.com/XTLS/Xray-core/releases/download/v26.3.27
           VERSION: ${{ github.ref_name }}
           COMMIT: ${{ github.sha }}
         run: |
@@ -39,7 +43,7 @@ jobs:
           # 构建逻辑统一在 scripts/build-bundle.sh（CI 以 dry-run 验证）。
           scripts/build-bundle.sh
       - name: Sign artifacts
-        if: ${{ env.XRAY_PROXY_MINISIGN_SECRET_KEY != '' }}
+        if: ${{ env.PROXYSCENE_MINISIGN_SECRET_KEY != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -49,7 +53,7 @@ jobs:
             rm -f minisign.key
           }
           trap cleanup EXIT
-          printf '%s' "$XRAY_PROXY_MINISIGN_SECRET_KEY" > minisign.key
+          printf '%s' "$PROXYSCENE_MINISIGN_SECRET_KEY" > minisign.key
           chmod 600 minisign.key
           # 签名 checksums.txt（联机安装校验用）。
           minisign -S -W -m dist/checksums.txt -s minisign.key -x dist/checksums.txt.minisig
